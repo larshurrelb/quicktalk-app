@@ -1,8 +1,16 @@
-<img src="https://img.shields.io/badge/macOS-14%2B-black" alt="macOS 14+"> <img src="https://img.shields.io/badge/Swift-6-orange" alt="Swift 6"> <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
+<p align="center">
+  <img src="AppIcon.png" width="128" alt="QuickTalk">
+</p>
 
-# QuickTalk
+<h1 align="center">QuickTalk</h1>
 
-**Hold a key, speak, let go — the text appears where your cursor is.**
+<p align="center"><strong>Hold a key, speak, let go — the text appears where your cursor is.</strong></p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/macOS-14%2B-black" alt="macOS 14+">
+  <img src="https://img.shields.io/badge/Swift-6-orange" alt="Swift 6">
+  <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
+</p>
 
 A push-to-talk dictation app for macOS. Menu bar only, no Dock icon, powered by Google's
 **Gemini 3.5 Transcribe** with your own API key. English and German are detected
@@ -163,6 +171,13 @@ Deliberately **no Xcode project** and **no third-party dependencies** — please
 that way. `CLAUDE.md` documents the platform traps behind the odd-looking code, including
 the Gemini API's two silent failure modes. Read it before "simplifying" anything; most of
 it is load-bearing.
+
+The icon is `AppIcon.png` — full-bleed 1024×1024 artwork with its own rounded corners.
+Regenerate the bundled `.icns` after changing it:
+
+```bash
+swift make-icon.swift && iconutil -c icns AppIcon.iconset -o AppIcon.icns
+```
 
 `build.sh` signs with your **Apple Development** certificate if you have one, and ad-hoc
 otherwise. Both work, but a certificate gives a stable signature, so macOS permissions are
