@@ -1,0 +1,10 @@
+# Build output
+.build/
+QuickTalk.app/
+AppIcon.iconset/
+
+# macOS
+.DS_Store
+
+# Never commit logs — Copy Diagnostics output belongs in an issue, not the repo
+*.log

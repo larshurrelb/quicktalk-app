@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>QuickTalk</string>
+    <key>CFBundleDisplayName</key>
+    <string>QuickTalk</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.quicktalk.QuickTalk</string>
+    <key>CFBundleExecutable</key>
+    <string>QuickTalk</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>QuickTalk records your voice while you hold the push-to-talk key, and sends it to Google Gemini to be transcribed.</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>MIT licensed. See LICENSE.</string>
+</dict>
+</plist>

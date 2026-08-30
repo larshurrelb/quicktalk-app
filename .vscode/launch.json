@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:quicktalk}",
+            "name": "Debug QuickTalk",
+            "target": "QuickTalk",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug QuickTalk"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:quicktalk}",
+            "name": "Release QuickTalk",
+            "target": "QuickTalk",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release QuickTalk"
+        }
+    ]
+}
