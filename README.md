@@ -4,7 +4,7 @@
 
 <h1 align="center">QuickTalk</h1>
 
-<p align="center"><strong>Hold a key, speak, let go — the text appears where your cursor is.</strong></p>
+<p align="center"><strong>A open source transcription App for Mac using Gemini 3.5 Transcribe.</strong></p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/macOS-14%2B-black" alt="macOS 14+">
@@ -13,10 +13,9 @@
 </p>
 
 A push-to-talk dictation app for macOS. Menu bar only, no Dock icon, powered by Google's
-**Gemini 3.5 Transcribe** with your own API key. English and German are detected
-automatically; there is no language setting to switch.
+**Gemini 3.5 Transcribe** with your own API key. 
 
-No dependencies, no telemetry, no accounts. One network destination, and it's Google's.
+No dependencies, no telemetry, no accounts. You bring your own key and Google handles the rest. 
 
 ---
 
@@ -38,7 +37,7 @@ open /Applications/QuickTalk.app
 
 Settings opens on first run. Work top to bottom:
 
-1. **Paste your Gemini API key** — free from [aistudio.google.com](https://aistudio.google.com).
+1. **Paste your Gemini API key** — get it from [aistudio.google.com](https://aistudio.google.com).
 2. **Grant Input Monitoring**, then **quit and reopen.** The restart is not optional.
 3. **Grant Accessibility** — takes effect immediately.
 4. **Grant Microphone** — you'll be asked on your first dictation.
@@ -48,7 +47,7 @@ everything is live; otherwise it names the missing permission.
 
 ## Using it
 
-Hold **Right ⌘**, speak, release. A pill appears at the bottom of the screen with a level
+Hold the hotkey, speak, release. A pill appears at the bottom of the screen with a level
 meter, switches to "Transcribing…", and the text is pasted at your cursor. Presses shorter
 than 0.25 s are ignored.
 
@@ -160,43 +159,12 @@ Keychain only raises the bar. If your machine stops being trustworthy, revoke th
 - **Your clipboard is restored** after the paste.
 - **One network destination**, `generativelanguage.googleapis.com`.
 
-## Contributing
-
-```bash
-./build.sh          # compile, assemble, sign, install
-swift build         # compile only (produces no runnable app)
-```
-
-Deliberately **no Xcode project** and **no third-party dependencies** — please keep it
-that way. `CLAUDE.md` documents the platform traps behind the odd-looking code, including
-the Gemini API's two silent failure modes. Read it before "simplifying" anything; most of
-it is load-bearing.
-
-The icon is `AppIcon.png` — full-bleed 1024×1024 artwork with its own rounded corners.
-Regenerate the bundled `.icns` after changing it:
-
-```bash
-swift make-icon.swift && iconutil -c icns AppIcon.iconset -o AppIcon.icns
-```
-
-`build.sh` signs with your **Apple Development** certificate if you have one, and ad-hoc
-otherwise. Both work, but a certificate gives a stable signature, so macOS permissions are
-granted once instead of re-granted every build.
-
-There are no automated tests. Check by hand: build, confirm the menu bar reads "Hold
-Right ⌘ to dictate", then **switch to another app** and dictate — that last step is what
-catches a missing Input Monitoring grant.
-
 ### Why there's no prebuilt download
 
 Gatekeeper blocks un-notarised downloads, and notarisation needs the paid Apple Developer
 Program plus a Developer ID certificate. A development-signed build won't run on other
-Macs at all, and any signature names its signer. Besides, an app that can type into every
-window deserves to be read before it's run.
+Macs at all, and any signature names its signer. 
 
-Forking to ship releases? You'll need a Developer ID certificate, `xcrun notarytool`, and
-your own bundle identifier — change `CFBundleIdentifier` in `Info.plist` and the matching
-`--identifier` in `build.sh`.
 
 ## License
 
