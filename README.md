@@ -17,6 +17,10 @@ A push-to-talk dictation app for macOS. Menu bar only, no Dock icon, powered by 
 
 No dependencies, no telemetry, no accounts. You bring your own key and Google handles the rest. 
 
+<p align="center">
+  <img src="Demo.gif" alt="QuickTalk Demo">
+</p>
+
 ---
 
 ## Install
