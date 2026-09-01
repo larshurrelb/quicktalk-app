@@ -29,7 +29,7 @@ fi
 echo "▸ Compiling…"
 swift build -c release
 
-echo "▸ Assembling $APP…"
+echo "▸ Assembling ${APP}…"
 rm -rf "$APP"
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
 cp .build/release/QuickTalk "$CONTENTS/MacOS/QuickTalk"

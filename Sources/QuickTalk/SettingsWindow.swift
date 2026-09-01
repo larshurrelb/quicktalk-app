@@ -39,7 +39,7 @@ final class SettingsWindowController {
 
         let view = makeView()
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 440, height: Self.height),
+            contentRect: NSRect(x: 0, y: 0, width: Self.width, height: Self.height),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -54,9 +54,15 @@ final class SettingsWindowController {
     }
 
     /// Shared by the window and the view's own frame — they have to agree, or the
-    /// content is either clipped or floating in dead space.
-    static let height: CGFloat = 780
+    /// content is either clipped or floating in dead space. Only the header and the
+    /// bottom note are pinned; the cards between them scroll, so the rows that appear
+    /// conditionally (a microphone warning, the three permission rows) can grow past
+    /// this without being cut off. Sized so the settled state — permissions granted,
+    /// no warning — needs no scrolling at all.
+    static let width: CGFloat = 480
+    static let height: CGFloat = 720
 }
+
 
 private struct SettingsView: View {
     let settings: AppSettings
@@ -101,166 +107,35 @@ private struct SettingsView: View {
         _devices = State(initialValue: AudioDevices.inputDevices())
     }
 
+    /// Header and footnote are pinned; the cards scroll between them.
+    ///
+    /// The cards are built by hand rather than with `Form { }.formStyle(.grouped)`,
+    /// which was the obvious thing to reach for and was measured at ~950pt of content —
+    /// a third of it the form's own row padding, which is not adjustable. These rows are
+    /// 30pt and everything still fits in a window smaller than the old flat layout.
+    ///
+    /// Sections are computed properties as much for the type-checker as for reading: one
+    /// expression this size takes seconds to compile.
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            HStack(alignment: .top) {
-                Spacer()
-                // NSApp.applicationIconImage is the bundled icon itself, so this stays in
-                // step with the Dock and menu bar automatically.
-                Image(nsImage: NSApp.applicationIconImage)
-                    .resizable()
-                    .interpolation(.high)
-                    .frame(width: 40, height: 40)
-            }
-            .padding(.bottom, -14)
-
-            section("Gemini API key") {
-                HStack(spacing: 8) {
-                    SecureField(hasKey ? "•••••••••  (stored — type to replace)" : "Paste your Gemini API key", text: $apiKey)
-                        .textFieldStyle(.roundedBorder)
-                        .onChange(of: apiKey) { _, value in
-                            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                            guard !trimmed.isEmpty else { return }
-                            settings.apiKey = trimmed
-                            hasKey = true
-                        }
-                    if hasKey {
-                        Button("Remove") {
-                            settings.clearAPIKey()
-                            apiKey = ""
-                            hasKey = false
-                        }
-                        .controlSize(.small)
-                    }
+        VStack(spacing: 0) {
+            header
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    apiKeySection
+                    recordingSection
+                    formattingSection
+                    permissionsSection
                 }
-                caption("Kept in a private file only your macOS account can read (mode 0600 in Application Support), excluded from backups, never written to preferences, never logged, and sent only to Google. Get one free at aistudio.google.com.")
+                .padding(.horizontal, 20)
+                .padding(.top, 2)
+                .padding(.bottom, 14)
             }
-
-            section("Push to talk") {
-                Picker("", selection: $hotkey) {
-                    ForEach(HotkeyKey.allCases) { key in
-                        Text(key.label).tag(key)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .frame(width: 160)
-                .onChange(of: hotkey) { _, value in
-                    settings.hotkey = value
-                    onHotkeyChange(value)
-                }
-                caption("Hold the key, speak, let go. The key keeps working normally otherwise.")
-            }
-
-            section("Microphone") {
-                Picker("", selection: $microphoneUID) {
-                    Text(defaultMicLabel).tag("")
-                    if !devices.isEmpty { Divider() }
-                    ForEach(devices) { device in
-                        Text(device.name).tag(device.id)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .frame(width: 260)
-                .onChange(of: microphoneUID) { _, value in settings.microphoneUID = value }
-
-                if !microphoneUID.isEmpty && AudioDevices.name(forUID: microphoneUID) == nil {
-                    caption("⚠︎ That device isn't connected right now — the system default will be used until it's back.")
-                } else if bluetoothMicSelected {
-                    // A Bluetooth headset cannot do good playback and a microphone at the
-                    // same time. This is the device's own limitation, not something the
-                    // app can work around — so say which choice avoids it.
-                    caption("⚠︎ This is a Bluetooth microphone. Recording from it switches the headphones into call mode, so playback drops to mono at 16 kHz until the dictation ends. Pick the built-in microphone to keep music at full quality while you dictate.")
-                } else {
-                    caption("Picked per device, not per app, so it sticks even when macOS switches its default.")
-                }
-            }
-
-            section("Formatting") {
-                Picker("", selection: $mode) {
-                    ForEach(TranscriptionMode.allCases) { m in
-                        Text(m.label).tag(m)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(width: 300)
-                .onChange(of: mode) { _, value in settings.mode = value }
-                caption(mode.detail)
-            }
-
-            section("Per-app instructions") {
-                HStack(spacing: 10) {
-                    Button("Manage Apps…", action: onManageApps)
-                        .controlSize(.small)
-                    Text(appRulesSummary)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
-                caption(mode == .smart
-                    ? "Standing notes per app — \u{201c}use more emojis\u{201d} in a chat app, plain prose in an editor. QuickTalk sees which app is in front when you press the key and adds that app\u{2019}s instructions."
-                    : "Only used in Smart mode, which is the only mode with a formatting step to apply them in.")
-            }
-
-            section("Sound") {
-                Toggle("Play a sound when recording starts and stops", isOn: $playSound)
-                    .onChange(of: playSound) { _, value in settings.playSound = value }
-                    .font(.system(size: 12))
-
-                HStack(spacing: 8) {
-                    Text("Start cue").font(.system(size: 12))
-                    Picker("", selection: $startSound) {
-                        ForEach(AppSettings.startSoundChoices, id: \.self) { name in
-                            Text(name).tag(name)
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                    .frame(width: 130)
-                    .onChange(of: startSound) { _, value in
-                        settings.startSound = value
-                        NSSound(named: value)?.play()   // hear it as you pick
-                    }
-                }
-                .disabled(!playSound)
-            }
-
-            Divider()
-
-            section("Permissions") {
-                permissionRow(
-                    "Microphone",
-                    granted: micGranted,
-                    action: { AudioRecorder.requestMicrophoneAccess { micGranted = $0 } }
-                )
-                permissionRow(
-                    "Input Monitoring",
-                    granted: inputGranted,
-                    action: {
-                        HotkeyMonitor.requestInputMonitoringPermission()
-                        openSettingsPane("Privacy_ListenEvent")
-                    }
-                )
-                permissionRow(
-                    "Accessibility",
-                    granted: axGranted,
-                    action: {
-                        HotkeyMonitor.requestAccessibilityPermission()
-                        openSettingsPane("Privacy_Accessibility")
-                    }
-                )
-                caption("Input Monitoring lets QuickTalk see the push-to-talk key while you're in another app — without it the hotkey only works when QuickTalk itself is frontmost. Accessibility lets it paste the result. macOS needs the app quit and reopened after granting Input Monitoring.")
-            }
-
-            Spacer()
-
-            Text("Language is detected automatically — German and English work without switching anything.")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
+            footnote
         }
-        .padding(20)
-        .frame(width: 440, height: SettingsWindowController.height, alignment: .topLeading)
+        .frame(width: SettingsWindowController.width, height: SettingsWindowController.height)
+        // Stated rather than inherited: the cards are `controlBackgroundColor`, and they
+        // only read as raised if what is behind them is the window's own colour.
+        .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             micGranted = AudioRecorder.hasMicrophoneAccess
             axGranted = HotkeyMonitor.hasAccessibilityPermission
@@ -270,12 +145,367 @@ private struct SettingsView: View {
         }
     }
 
+    // MARK: - Header
+
+    private var header: some View {
+        HStack(spacing: 12) {
+            // NSApp.applicationIconImage is the bundled icon itself, so this stays in
+            // step with the Dock and menu bar automatically.
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .interpolation(.high)
+                .frame(width: 40, height: 40)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text("QuickTalk").font(.system(size: 15, weight: .semibold))
+                // Reads back the key that is actually bound, so the one line everyone
+                // looks for cannot go stale after changing it.
+                Text("Hold \(hotkey.label) to dictate")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 12)
+            statusChip
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 14)
+        .padding(.bottom, 14)
+    }
+
+    /// A one-glance answer to "will this work if I hold the key right now?" — the same
+    /// conditions the menu bar title reports, plus the key.
+    private var statusChip: some View {
+        let ready = hasKey && allPermissionsGranted
+        return HStack(spacing: 5) {
+            Circle()
+                .fill(ready ? Color.green : Color.orange)
+                .frame(width: 6, height: 6)
+            Text(ready ? "Ready" : "Needs setup")
+                .font(.system(size: 11, weight: .medium))
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4)
+        .background(.quaternary, in: Capsule())
+    }
+
+    private var footnote: some View {
+        Text("Language is detected automatically — German and English need no switching.")
+            .font(.system(size: 11))
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 20)
+            .padding(.top, 10)
+            .padding(.bottom, 14)
+    }
+
+    // MARK: - Sections
+
+    private var apiKeySection: some View {
+        section("Gemini API key") {
+            HStack(spacing: 8) {
+                // A field's placeholder is drawn as a *label* beside it in a labelled
+                // row; `prompt:` is what keeps the hint inside the field itself.
+                SecureField(
+                    "",
+                    text: $apiKey,
+                    prompt: Text(hasKey ? "•••••••••  stored — type to replace" : "Paste your Gemini API key")
+                )
+                .labelsHidden()
+                .textFieldStyle(.roundedBorder)
+                .onChange(of: apiKey) { _, value in
+                    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else { return }
+                    settings.apiKey = trimmed
+                    hasKey = true
+                }
+
+                if hasKey {
+                    Button("Remove") {
+                        settings.clearAPIKey()
+                        apiKey = ""
+                        hasKey = false
+                    }
+                    .controlSize(.small)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+        } footer: {
+            VStack(alignment: .leading, spacing: 3) {
+                caption("Kept in a file only your macOS account can read — mode 0600, excluded from backups, never written to preferences, never logged, and sent only to Google.")
+                Link("Get one free at aistudio.google.com", destination: Self.apiKeyURL)
+                    .font(.system(size: 11))
+            }
+        }
+    }
+
+    private var recordingSection: some View {
+        section("Recording") {
+            row("Push-to-talk key") {
+                Picker("", selection: $hotkey) {
+                    ForEach(HotkeyKey.allCases) { key in
+                        Text(key.label).tag(key)
+                    }
+                }
+                .labelsHidden()
+                .fixedSize()
+                .onChange(of: hotkey) { _, value in
+                    settings.hotkey = value
+                    onHotkeyChange(value)
+                }
+            }
+            rowDivider
+            row("Microphone") {
+                Picker("", selection: $microphoneUID) {
+                    Text(defaultMicLabel).tag("")
+                    if !devices.isEmpty { Divider() }
+                    ForEach(devices) { device in
+                        Text(device.name).tag(device.id)
+                    }
+                }
+                .labelsHidden()
+                .frame(maxWidth: 280)
+                .onChange(of: microphoneUID) { _, value in settings.microphoneUID = value }
+            }
+            if let micWarning {
+                rowDivider
+                warningRow(micWarning)
+            }
+            rowDivider
+            row("Play a sound when recording starts and stops") {
+                Toggle("", isOn: $playSound)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .onChange(of: playSound) { _, value in settings.playSound = value }
+            }
+            rowDivider
+            row("Start cue") {
+                Picker("", selection: $startSound) {
+                    ForEach(AppSettings.startSoundChoices, id: \.self) { name in
+                        Text(name).tag(name)
+                    }
+                }
+                .labelsHidden()
+                .fixedSize()
+                .onChange(of: startSound) { _, value in
+                    settings.startSound = value
+                    NSSound(named: value)?.play()   // hear it as you pick
+                }
+            }
+            .disabled(!playSound)
+        } footer: {
+            VStack(alignment: .leading, spacing: 3) {
+                caption("Hold the key, speak, let go. The key keeps working normally otherwise.")
+                // Dropped while a warning is up — that one is the line to read.
+                if micWarning == nil {
+                    caption("The microphone is picked per device, not per app, so it sticks even when macOS switches its default.")
+                }
+            }
+        }
+    }
+
+    private var formattingSection: some View {
+        section("Formatting") {
+            VStack(alignment: .leading, spacing: 6) {
+                Picker("", selection: $mode) {
+                    ForEach(TranscriptionMode.allCases) { m in
+                        Text(m.label).tag(m)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                // A segmented control keeps its intrinsic width and centres itself in
+                // whatever it is given, which left it floating mid-card. Pin it leading
+                // so it lines up with the row labels above and below.
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .onChange(of: mode) { _, value in settings.mode = value }
+
+                caption(mode.detail)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+
+            rowDivider
+
+            row("Per-app instructions") {
+                HStack(spacing: 8) {
+                    Text(appRulesSummary)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    Button("Manage…", action: onManageApps)
+                        .controlSize(.small)
+                }
+            }
+        } footer: {
+            caption(mode == .smart
+                ? "Standing notes per app — “use more emojis” in a chat app, plain prose in an editor. Applied to whichever app is in front when you press the key."
+                : "Instructions are only used in Smart mode, which is the only mode with a formatting step to apply them in.")
+        }
+    }
+
+    /// Three rows while anything is missing, one line once it is all granted. The long
+    /// explanation is what you need *while* you are fixing it; afterwards it is a wall
+    /// of text between you and everything above it.
+    private var permissionsSection: some View {
+        section("Permissions") {
+            if allPermissionsGranted {
+                HStack(spacing: 9) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text("Microphone, Input Monitoring and Accessibility are granted")
+                        .font(.system(size: 12))
+                    Spacer(minLength: 8)
+                }
+                .padding(.horizontal, 12)
+                .frame(height: 30)
+            } else {
+                permissionRow(
+                    "Microphone",
+                    icon: "mic.fill",
+                    granted: micGranted,
+                    action: { AudioRecorder.requestMicrophoneAccess { micGranted = $0 } }
+                )
+                rowDivider
+                permissionRow(
+                    "Input Monitoring",
+                    icon: "keyboard",
+                    granted: inputGranted,
+                    action: {
+                        HotkeyMonitor.requestInputMonitoringPermission()
+                        openSettingsPane("Privacy_ListenEvent")
+                    }
+                )
+                rowDivider
+                permissionRow(
+                    "Accessibility",
+                    icon: "hand.point.up.left.fill",
+                    granted: axGranted,
+                    action: {
+                        HotkeyMonitor.requestAccessibilityPermission()
+                        openSettingsPane("Privacy_Accessibility")
+                    }
+                )
+            }
+        } footer: {
+            if !allPermissionsGranted {
+                caption("Input Monitoring lets QuickTalk see the push-to-talk key while you're in another app — without it the hotkey only works when QuickTalk itself is frontmost. Accessibility lets it paste the result. macOS needs the app quit and reopened after granting Input Monitoring.")
+            }
+        }
+    }
+
+    // MARK: - Building blocks
+
+    private static let apiKeyURL = URL(string: "https://aistudio.google.com/apikey")!
+
+    private var allPermissionsGranted: Bool { micGranted && inputGranted && axGranted }
+
+    private func section<Content: View, Footer: View>(
+        _ title: String,
+        @ViewBuilder content: () -> Content,
+        @ViewBuilder footer: () -> Footer
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.system(size: 12, weight: .semibold))
+            card { content() }
+            footer().padding(.horizontal, 2)
+        }
+    }
+
+    /// The card is what the grouped `Form` would have drawn — a filled, hairline-bordered
+    /// container — at a row height this window can afford.
+    private func card<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        VStack(spacing: 0) { content() }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color(nsColor: .controlBackgroundColor))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.08))
+            )
+    }
+
+    /// Inset on the leading edge so the rule reads as separating rows inside one card,
+    /// rather than cutting the card in half.
+    private var rowDivider: some View {
+        Divider().padding(.leading, 12)
+    }
+
+    private func row<Control: View>(_ label: String, @ViewBuilder control: () -> Control) -> some View {
+        HStack(spacing: 10) {
+            Text(label).font(.system(size: 12))
+            Spacer(minLength: 8)
+            control()
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 30)
+    }
+
+    /// The leading glyph names the permission, the trailing state says whether it is
+    /// there — "Grant…" only appears on the ones that still need it.
+    private func permissionRow(
+        _ name: String,
+        icon: String,
+        granted: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        HStack(spacing: 9) {
+            Image(systemName: icon)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+            Text(name).font(.system(size: 12))
+            Spacer(minLength: 8)
+            if granted {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                    .help("Granted")
+            } else {
+                Button("Grant…", action: action).controlSize(.small)
+            }
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 30)
+    }
+
+    private func warningRow(_ text: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 10))
+                .foregroundStyle(.orange)
+                .padding(.top, 2)
+            caption(text)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    // MARK: - Text
+
     /// Whether the microphone that would actually be used is a Bluetooth one — either
     /// chosen explicitly, or reached through "System Default".
     private var bluetoothMicSelected: Bool {
         microphoneUID.isEmpty
             ? AudioDevices.defaultInputIsBluetooth
             : AudioDevices.isBluetooth(uid: microphoneUID)
+    }
+
+    private var micWarning: String? {
+        if !microphoneUID.isEmpty && AudioDevices.name(forUID: microphoneUID) == nil {
+            return "That device isn't connected right now — the system default will be used until it's back."
+        }
+        // A Bluetooth headset cannot do good playback and a microphone at the same time.
+        // That is the device's own limitation, not something the app can work around —
+        // so say which choice avoids it.
+        if bluetoothMicSelected {
+            return "Bluetooth microphone: recording switches the headphones into call mode, so playback drops to mono at 16 kHz until you stop. Pick the built-in microphone to keep music at full quality."
+        }
+        return nil
     }
 
     private var appRulesSummary: String {
@@ -291,30 +521,11 @@ private struct SettingsView: View {
         return "System Default"
     }
 
-    private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(title).font(.system(size: 12, weight: .semibold))
-            content()
-        }
-    }
-
     private func caption(_ text: String) -> some View {
         Text(text)
             .font(.system(size: 11))
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
-    }
-
-    private func permissionRow(_ name: String, granted: Bool, action: @escaping () -> Void) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: granted ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
-                .foregroundStyle(granted ? .green : .orange)
-            Text(name).font(.system(size: 12))
-            Spacer()
-            if !granted {
-                Button("Grant…", action: action).controlSize(.small)
-            }
-        }
     }
 
     private func openSettingsPane(_ pane: String) {
