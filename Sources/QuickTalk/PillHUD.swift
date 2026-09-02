@@ -39,6 +39,37 @@ final class PillModel: ObservableObject {
     }
 }
 
+/// The pill's drop shadow, and the room the panel has to leave for it.
+///
+/// SwiftUI's blur reaches about **twice** the nominal radius before it fades out, which is
+/// not obvious from the API and is what made this wrong. Rendered and measured at radius
+/// 12: the last visible pixels sit 25pt to each side, 22pt above and 30pt below the
+/// capsule — against a uniform 14pt of padding, so the falloff was being sliced off
+/// mid-gradient. A cut gradient does not read as a soft shadow, it reads as a straight
+/// grey edge, and it was worst along the bottom where the y offset pushes the blur further.
+///
+/// Keep the insets derived from `radius` and `offsetY` rather than typed in. Every one of
+/// them is wrong the moment someone nudges the shadow and doesn't know to re-measure.
+enum PillShadow {
+    static let color = Color.black.opacity(0.28)
+    static let radius: CGFloat = 12
+    static let offsetY: CGFloat = 4
+
+    /// Twice the radius, plus slack: at exactly 2×+2 the outermost pixel of the gradient
+    /// still lands on the panel edge.
+    private static let reach = radius * 2 + 4
+
+    static let side = reach
+    static let top = reach - offsetY
+    static let bottom = reach + offsetY
+
+    /// How high the *capsule* sits above the bottom of the screen. Measured to the pill
+    /// itself rather than to the panel, because the panel's own height now depends on the
+    /// shadow — position it by the panel and the pill drifts upward every time the shadow
+    /// gets softer.
+    static let heightAboveScreenBottom: CGFloat = 102
+}
+
 /// The floating pill.
 ///
 /// An `NSPanel` with `.nonactivatingPanel` is the whole trick: it appears above every
@@ -50,13 +81,38 @@ final class PillHUD {
     private var host: NSHostingView<PillView>?
     let model = PillModel()
 
-    /// Only a starting guess — the panel is resized to whatever SwiftUI reports as its
-    /// fitting size, so "Transcribing…" doesn't sit in a box built for the waveform.
-    private static let initialSize = CGSize(width: 200, height: 68)
+    /// Bumped by every `show` and every `dismiss`, so work scheduled by an earlier state
+    /// can tell it has been superseded. Without it, tapping the hotkey repeatedly stacked
+    /// a fresh panel on top of one still fading out, and which of them survived came down
+    /// to whichever animation happened to finish last.
+    private var generation = 0
+    private var pendingDismissal: DispatchWorkItem?
+
+    /// Only a starting guess — `resizeToFit` runs before the panel is ever shown, so this
+    /// is never what appears. It still tracks the real height, because a first layout pass
+    /// at the wrong size is a hitch nobody needs.
+    private static let initialSize = CGSize(
+        width: 200 + PillShadow.side * 2,
+        height: 40 + PillShadow.top + PillShadow.bottom
+    )
 
     func show(_ state: PillState) {
+        generation &+= 1
+        pendingDismissal?.cancel()
+        pendingDismissal = nil
         model.state = state
-        guard panel == nil else { return }
+
+        // Reuse the panel a fade has not finished with yet, rather than leaving it to
+        // wander off screen on its own while a new one appears underneath it.
+        if let panel {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0
+                panel.animator().alphaValue = 1
+            }
+            resizeToFit()
+            panel.orderFrontRegardless()
+            return
+        }
 
         let panel = NSPanel(
             contentRect: NSRect(origin: .zero, size: Self.initialSize),
@@ -74,6 +130,8 @@ final class PillHUD {
         panel.hidesOnDeactivate = false
         panel.animationBehavior = .none
 
+        panel.alphaValue = 1
+
         let host = NSHostingView(rootView: PillView(model: model))
         panel.contentView = host
 
@@ -89,9 +147,12 @@ final class PillHUD {
         guard let panel, let host else { return }
         host.layoutSubtreeIfNeeded()
 
+        // Floors, not targets — they only matter for a state narrower than the shadow
+        // margins, and they have to clear those margins or the panel would clip the very
+        // thing it is sized to contain.
         var size = host.fittingSize
-        size.width = max(size.width, 120)
-        size.height = max(size.height, 56)
+        size.width = max(size.width, 120 + PillShadow.side * 2)
+        size.height = max(size.height, 40 + PillShadow.top + PillShadow.bottom)
 
         panel.setContentSize(size)
         host.frame = NSRect(origin: .zero, size: size)
@@ -109,28 +170,43 @@ final class PillHUD {
     }
 
     /// Fades out after `delay`, so a result is readable before the pill disappears.
+    ///
+    /// The panel is held until the fade actually completes. A `show` arriving in the
+    /// meantime cancels the fade and takes the panel back, which is what keeps a burst of
+    /// quick presses to one pill instead of a pile of them.
     func dismiss(after delay: TimeInterval = 0) {
-        guard let panel else { return }
-        self.panel = nil
-        self.host = nil
+        guard panel != nil else { return }
+        generation &+= 1
+        let token = generation
 
-        guard delay > 0 else {
-            Self.fadeOut(panel)
-            return
+        pendingDismissal?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.generation == token, let panel = self.panel else { return }
+            self.pendingDismissal = nil
+            self.fadeOut(panel, token: token)
         }
+        pendingDismissal = work
 
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            Self.fadeOut(panel)
-        }
+        guard delay > 0 else { return work.perform() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    private static func fadeOut(_ panel: NSPanel) {
+    private func fadeOut(_ panel: NSPanel, token: Int) {
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.18
             panel.animator().alphaValue = 0
-        } completionHandler: {
-            panel.orderOut(nil)
+        } completionHandler: { [weak self] in
+            // AppKit runs this on the main thread; the compiler just can't see that.
+            MainActor.assumeIsolated {
+                // A new take may have claimed this panel mid-fade — `show` already restored
+                // its opacity, so ordering it out here would hide a pill that is in use.
+                guard let self, self.generation == token else { return }
+                panel.orderOut(nil)
+                if self.panel === panel {
+                    self.panel = nil
+                    self.host = nil
+                }
+            }
         }
     }
 
@@ -143,7 +219,7 @@ final class PillHUD {
 
         let origin = NSPoint(
             x: frame.midX - panel.frame.width / 2,
-            y: frame.minY + 88
+            y: frame.minY + PillShadow.heightAboveScreenBottom - PillShadow.bottom
         )
         panel.setFrameOrigin(origin)
     }
@@ -180,9 +256,13 @@ private struct PillView: View {
                     )
             }
         }
-        .shadow(color: .black.opacity(0.28), radius: 12, y: 4)
-        // Room for the shadow to draw inside the panel instead of being clipped.
-        .padding(14)
+        .shadow(color: PillShadow.color, radius: PillShadow.radius, y: PillShadow.offsetY)
+        // Room for the shadow to draw inside the panel instead of being clipped. Asymmetric
+        // because the shadow is: the y offset moves the blur down, so the bottom needs more
+        // room than the top and a uniform inset can only be right on one of them.
+        .padding(.horizontal, PillShadow.side)
+        .padding(.top, PillShadow.top)
+        .padding(.bottom, PillShadow.bottom)
         .animation(.easeOut(duration: 0.18), value: model.state)
     }
 

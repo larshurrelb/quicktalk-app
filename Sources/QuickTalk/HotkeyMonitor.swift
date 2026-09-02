@@ -67,6 +67,8 @@ final class HotkeyMonitor {
         // going silently dead.
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            Diagnostics.log("event tap was disabled — re-armed")
+            recoverMissedRelease()
             return
         }
 
@@ -81,6 +83,21 @@ final class HotkeyMonitor {
         DispatchQueue.main.async { [onDown, onUp] in
             down ? onDown() : onUp()
         }
+    }
+
+    /// A disabled tap drops every event that happened while it was off, and the one that
+    /// hurts is the *release*: the app is then left recording with nothing to stop it.
+    ///
+    /// Recovery is one-directional on purpose. Deducing a release from the live modifier
+    /// state is safe — the key demonstrably is not held. Deducing a *press* would not be:
+    /// the mask cannot tell left ⌘ from right ⌘, so it would start dictating because the
+    /// user reached for a shortcut on the other side of the keyboard.
+    private func recoverMissedRelease() {
+        guard isDown else { return }
+        guard !CGEventSource.flagsState(.combinedSessionState).contains(key.mask) else { return }
+        isDown = false
+        Diagnostics.log("release was lost with the tap — ending the take")
+        DispatchQueue.main.async { [onUp] in onUp() }
     }
 
     static var hasAccessibilityPermission: Bool {

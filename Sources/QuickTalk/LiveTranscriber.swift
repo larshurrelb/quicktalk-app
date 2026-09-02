@@ -43,6 +43,19 @@ final class LiveTranscriber {
     /// and an end signal that jumps the queue truncates the last words.
     private let sendQueue = DispatchQueue(label: "com.quicktalk.QuickTalk.live.send")
 
+    /// Deadlines are scheduled here, and they resume the waiting continuation themselves.
+    ///
+    /// The previous version raced a sleeping task against the continuation inside a
+    /// `withThrowingTaskGroup`, and that deadlocks: the group waits for *every* child on
+    /// the way out, and a checked continuation does not answer cancellation. Once the
+    /// deadline child threw, the group sat forever on a continuation child nothing would
+    /// ever resume — so `finish()` never returned, `isBusy` was never cleared, and the
+    /// pill stayed on "Transcribing…" until the app was relaunched. There is now exactly
+    /// one continuation per wait, and every path that resumes it cancels the deadline.
+    private static let deadlines = DispatchQueue(label: "com.quicktalk.QuickTalk.live.deadline")
+    private var setupDeadline: DispatchWorkItem?
+    private var finishDeadline: DispatchWorkItem?
+
     private let lock = NSLock()
     private var setupDone = false
     private var buffered: [Data] = []
@@ -68,7 +81,7 @@ final class LiveTranscriber {
 
     /// Connects and waits for the server to acknowledge setup. Audio may be appended
     /// before this returns — it is buffered and flushed in order.
-    func start(setupDeadline: TimeInterval = 5) async throws {
+    func start(setupDeadline seconds: TimeInterval = 5) async throws {
         var request = URLRequest(url: URL(string: Self.endpoint)!)
         request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
 
@@ -79,26 +92,21 @@ final class LiveTranscriber {
 
         send(Self.setupFrame(smart: smart))
 
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask { [weak self] in
-                try await withCheckedThrowingContinuation { continuation in
-                    guard let self else { return continuation.resume() }
-                    self.lock.lock()
-                    if self.setupDone {
-                        self.lock.unlock()
-                        continuation.resume()
-                    } else {
-                        self.setupWaiter = continuation
-                        self.lock.unlock()
-                    }
-                }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            lock.lock()
+            if setupDone {
+                lock.unlock()
+                return continuation.resume()
             }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(setupDeadline * 1_000_000_000))
-                throw LiveError.setupTimeout
+            if terminated {
+                lock.unlock()
+                return continuation.resume(throwing: LiveError.socket("cancelled"))
             }
-            try await group.next()
-            group.cancelAll()
+            setupWaiter = continuation
+            let deadline = DispatchWorkItem { [weak self] in self?.setupTimedOut() }
+            setupDeadline = deadline
+            lock.unlock()
+            Self.deadlines.asyncAfter(deadline: .now() + seconds, execute: deadline)
         }
     }
 
@@ -118,32 +126,28 @@ final class LiveTranscriber {
     }
 
     /// Ends the turn and waits for the server's final transcript.
-    func finish(deadline: TimeInterval = 6) async throws -> String {
-        // Queued behind every audio frame already sent, by construction.
-        send(Self.activityEndFrame())
+    func finish(deadline seconds: TimeInterval = 6) async throws -> String {
+        endTurn()
 
-        let text = try await withThrowingTaskGroup(of: String.self) { group in
-            group.addTask { [weak self] in
-                try await withCheckedThrowingContinuation { continuation in
-                    guard let self else { return continuation.resume(throwing: LiveError.noTranscript) }
-                    self.lock.lock()
-                    if !self.finals.isEmpty {
-                        let joined = self.finals.joined(separator: " ")
-                        self.lock.unlock()
-                        continuation.resume(returning: joined)
-                    } else {
-                        self.finishWaiter = continuation
-                        self.lock.unlock()
-                    }
-                }
+        let text: String = try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            if !finals.isEmpty {
+                let joined = finals.joined(separator: " ")
+                lock.unlock()
+                return continuation.resume(returning: joined)
             }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(deadline * 1_000_000_000))
-                throw LiveError.noTranscript
+            if terminated {
+                // Setup already failed or the session was cancelled — nothing is coming.
+                // Answering now sends the caller straight to the batch request instead of
+                // making it wait out a deadline for a socket that is already dead.
+                lock.unlock()
+                return continuation.resume(throwing: LiveError.noTranscript)
             }
-            let result = try await group.next()!
-            group.cancelAll()
-            return result
+            finishWaiter = continuation
+            let deadline = DispatchWorkItem { [weak self] in self?.finishTimedOut() }
+            finishDeadline = deadline
+            lock.unlock()
+            Self.deadlines.asyncAfter(deadline: .now() + seconds, execute: deadline)
         }
 
         cancel()
@@ -153,12 +157,59 @@ final class LiveTranscriber {
         return trimmed
     }
 
+    /// Sends the end-of-turn marker — in order, behind the audio.
+    ///
+    /// `sendQueue` keeps frames in order once they are on the socket, but before setup
+    /// completes the audio is not on the socket at all: it is sitting in `buffered`,
+    /// waiting to be flushed. So the end frame has to queue up *there* instead, or it
+    /// overtakes the entire take. That is not a lost race, it is a lost dictation — the
+    /// server finalises on what it has received, and a turn ended before any audio arrived
+    /// simply never answers. A burst of quick presses is exactly how you get there: the
+    /// socket is still setting up at key-up.
+    private func endTurn() {
+        lock.lock()
+        guard setupDone else {
+            buffered.append(Self.activityEndFrame())
+            return lock.unlock()
+        }
+        lock.unlock()
+        send(Self.activityEndFrame())
+    }
+
+    private func setupTimedOut() {
+        lock.lock()
+        guard !terminated, let waiter = setupWaiter else { return lock.unlock() }
+        setupWaiter = nil
+        setupDeadline = nil
+        lock.unlock()
+        waiter.resume(throwing: LiveError.setupTimeout)
+    }
+
+    private func finishTimedOut() {
+        lock.lock()
+        guard let waiter = finishWaiter else { return lock.unlock() }
+        finishWaiter = nil
+        finishDeadline = nil
+        // Whatever did arrive before the deadline is still words worth keeping. Coming up
+        // empty falls through to the batch request, which still has the whole recording.
+        let collected = finals.joined(separator: " ")
+        lock.unlock()
+
+        Diagnostics.log("live finish timed out — \(collected.isEmpty ? "falling back to batch" : "keeping \(collected.count) chars")")
+        if collected.isEmpty {
+            waiter.resume(throwing: LiveError.noTranscript)
+        } else {
+            waiter.resume(returning: collected)
+        }
+    }
+
     func cancel() {
         lock.lock()
         terminated = true
         let waiters = (setupWaiter, finishWaiter)
         setupWaiter = nil
         finishWaiter = nil
+        clearDeadlines()
         lock.unlock()
 
         waiters.0?.resume(throwing: LiveError.socket("cancelled"))
@@ -228,6 +279,8 @@ final class LiveTranscriber {
             finals.append(text)
             let waiter = finishWaiter
             finishWaiter = nil
+            finishDeadline?.cancel()
+            finishDeadline = nil
             let joined = finals.joined(separator: " ")
             lock.unlock()
             waiter?.resume(returning: joined)
@@ -242,6 +295,8 @@ final class LiveTranscriber {
         buffered = []
         let waiter = setupWaiter
         setupWaiter = nil
+        setupDeadline?.cancel()
+        setupDeadline = nil
         lock.unlock()
 
         // The turn opens explicitly: automatic voice detection is disabled, because the
@@ -261,6 +316,7 @@ final class LiveTranscriber {
         let finish = finishWaiter
         setupWaiter = nil
         finishWaiter = nil
+        clearDeadlines()
         let collected = finals.joined(separator: " ")
         lock.unlock()
 
@@ -271,6 +327,14 @@ final class LiveTranscriber {
         } else {
             finish?.resume(returning: collected)
         }
+    }
+
+    /// Caller must hold `lock`.
+    private func clearDeadlines() {
+        setupDeadline?.cancel()
+        finishDeadline?.cancel()
+        setupDeadline = nil
+        finishDeadline = nil
     }
 
     // MARK: - Frames

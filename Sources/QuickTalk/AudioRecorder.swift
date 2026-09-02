@@ -23,10 +23,46 @@ import CoreAudio
 /// An AUHAL takes `kAudioOutputUnitProperty_CurrentDevice` *before* `AudioUnitInitialize`
 /// and keeps it, so nothing but the chosen device is ever opened. Verified by watching the
 /// Bluetooth device's channel count and sample rate across a recording.
-final class AudioRecorder {
+///
+/// `@unchecked Sendable` is a claim about discipline rather than an escape hatch, so here
+/// is the discipline: every mutable field is written on `control`, or on the audio thread
+/// that `control` starts and stops around. The two callbacks are ordered rather than
+/// locked: `onLevel` is set once at launch, and `onPCM` is written in exactly two places —
+/// from the caller *before* `start`, which crosses `control` before the IO thread exists,
+/// and by `close()` on `control` itself, once the IO thread is gone. Neither can race a
+/// callback that is actually running, which is why no caller may clear `onPCM` itself.
+final class AudioRecorder: @unchecked Sendable {
     /// 16 kHz mono is plenty for speech and keeps the upload small, which is most of the
     /// round-trip time for a short dictation.
     private static let sampleRate: Double = 16_000
+
+    /// **Every CoreAudio call below runs here, never on the main thread.**
+    ///
+    /// Opening an input device is neither quick nor bounded. Measured across 98 takes in
+    /// the diagnostics log, the gap between key-down and `recording started` was under a
+    /// second 84 times and reached **three seconds** three times — all of them with the
+    /// *built-in* microphone selected, so a Bluetooth profile switch is not the
+    /// explanation. (What is, the new `open=` timing breakdown will say next time it
+    /// happens.) Sitting on the main thread through that costs far more than the wait:
+    ///
+    ///   * the pill cannot appear, so a slow start is indistinguishable from a dead app;
+    ///   * macOS disables an event tap whose run loop stops answering, and the event most
+    ///     likely to be lost is the key *release* — leaving the app recording with nothing
+    ///     left to stop it.
+    ///
+    /// The queue is serial, so start, stop and discard can never overlap and the audio
+    /// callback still sees a single writer for everything it touches.
+    private let control = DispatchQueue(label: "com.quicktalk.QuickTalk.recorder", qos: .userInitiated)
+
+    /// One finished recording.
+    ///
+    /// The peak travels with the file rather than being read off the recorder afterwards:
+    /// it is written from the audio thread, and the only moment it can be read safely is
+    /// once capture has stopped — which is exactly when this is handed over.
+    struct Take {
+        let fileURL: URL
+        let peakLevel: Float
+    }
 
     /// The input bus of an AUHAL. Bus 0 is output to the device, which we disable.
     private static let inputBus: AudioUnitElement = 1
@@ -50,9 +86,12 @@ final class AudioRecorder {
 
     private var smoothedLevel: Float = 0
     /// Loudest sample seen this take — a peak of ~0 means the wrong input was captured.
-    private(set) var peakLevel: Float = 0
+    /// Written on the audio thread, read only once capture has stopped, via `Take`.
+    private var peakLevel: Float = 0
 
-    private(set) var isRecording = false
+    /// Only ever touched on `control`; callers track the take's phase themselves, because
+    /// between key-down and the device answering there is no useful answer to give.
+    private var isRecording = false
 
     enum RecorderError: Error {
         case noInputDevice
@@ -67,11 +106,59 @@ final class AudioRecorder {
         let name: String
     }
 
-    /// `deviceUID` empty means follow the system default input.
-    func start(deviceUID: String = "") throws {
-        stopEngine()
+    // MARK: - Control
 
+    /// Opens the microphone and begins capture. `deviceUID` empty follows the system
+    /// default input.
+    ///
+    /// Async because the work behind it can block for seconds — see `control`.
+    func start(deviceUID: String = "") async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            control.async { [self] in
+                do {
+                    try open(deviceUID: deviceUID)
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Stops capture and returns the finished take, or nil if nothing was recorded.
+    func stop() async -> Take? {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Take?, Never>) in
+            control.async { [self] in continuation.resume(returning: close()) }
+        }
+    }
+
+    /// Throws the current take away. Fire-and-forget: nobody is waiting on a recording
+    /// that is being discarded, and making the caller wait would put the queue's latency
+    /// back on the main thread for no reason.
+    func discard() {
+        control.async { [self] in
+            if let take = close() { try? FileManager.default.removeItem(at: take.fileURL) }
+        }
+    }
+
+    /// `discard()` for callers that must not outlive it — app termination, where a
+    /// fire-and-forget cleanup would simply not happen.
+    func discardAndWait() {
+        control.sync { if let take = close() { try? FileManager.default.removeItem(at: take.fileURL) } }
+    }
+
+    private func open(deviceUID: String) throws {
+        closeEngine()
+
+        // Timed in three parts, because "sometimes it takes a moment to start" is not
+        // something you can act on. Resolve being slow means HAL contention — something
+        // else on the machine, a Bluetooth headset most likely, is keeping coreaudiod
+        // busy. Configure or start being slow means the chosen device itself is taking
+        // its time. The wait is off the main thread either way, so this is now a number
+        // to read rather than a freeze to explain.
+        let began = DispatchTime.now()
         let device = try Self.resolve(uid: deviceUID)
+        let resolved = DispatchTime.now()
         let unit = try Self.makeInputUnit(device: device.id)
         var failed = true
         defer { if failed { AudioComponentInstanceDispose(unit) } }
@@ -150,6 +237,7 @@ final class AudioRecorder {
         guard initStatus == noErr else {
             throw RecorderError.couldNotConfigure("initialize", initStatus)
         }
+        let configured = DispatchTime.now()
 
         // Everything the callback touches must be in place before IO starts.
         self.unit = unit
@@ -168,17 +256,27 @@ final class AudioRecorder {
             self.converter = nil
             self.captureBuffer = nil
             self.fileURL = nil
+            // The WAV was created before the unit was started; nothing will ever read it.
+            try? FileManager.default.removeItem(at: url)
             throw RecorderError.couldNotConfigure("start", startStatus)
         }
 
         failed = false
         isRecording = true
+        let running = DispatchTime.now()
         // The device *name* is logged, not just the stored UID. When the picker was
         // silently ignored, the log said "system default" either way and hid the bug.
         Diagnostics.log(
             "recording started device=\(device.name) [\(device.uid)] "
-            + "rate=\(Int(hardware.mSampleRate))Hz ch=\(Int(hardware.mChannelsPerFrame))"
+            + "rate=\(Int(hardware.mSampleRate))Hz ch=\(Int(hardware.mChannelsPerFrame)) "
+            + "open=\(Self.ms(began, running))ms "
+            + "(resolve \(Self.ms(began, resolved)), configure \(Self.ms(resolved, configured)), "
+            + "start \(Self.ms(configured, running)))"
         )
+    }
+
+    private static func ms(_ from: DispatchTime, _ to: DispatchTime) -> Int {
+        Int((to.uptimeNanoseconds &- from.uptimeNanoseconds) / 1_000_000)
     }
 
     // MARK: - Device and unit setup
@@ -281,29 +379,25 @@ final class AudioRecorder {
         return noErr
     }
 
-    /// Stops capture and returns the finished file, or nil if nothing was recorded.
-    @discardableResult
-    func stop() -> URL? {
+    private func close() -> Take? {
+        closeEngine()
+        // Capture has stopped and the IO thread is gone, so this is the one safe moment to
+        // drop the PCM consumer. Clearing it from the main thread — which is where the
+        // live session is torn down — would race a callback still reading it.
+        onPCM = nil
+
         guard isRecording else { return nil }
-        stopEngine()
         isRecording = false
         let url = fileURL
         fileURL = nil
 
-        if let url {
-            let bytes = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
-            Diagnostics.log("recording stopped bytes=\(bytes) peakLevel=\(String(format: "%.3f", peakLevel))")
-        }
-        return url
+        guard let url else { return nil }
+        let bytes = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+        Diagnostics.log("recording stopped bytes=\(bytes) peakLevel=\(String(format: "%.3f", peakLevel))")
+        return Take(fileURL: url, peakLevel: peakLevel)
     }
 
-    func discard() {
-        let url = fileURL
-        _ = stop()
-        if let url { try? FileManager.default.removeItem(at: url) }
-    }
-
-    private func stopEngine() {
+    private func closeEngine() {
         if let unit {
             // Synchronous: it does not return until the IO thread has stopped, so no
             // render callback can still be running when the buffers go away below.

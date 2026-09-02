@@ -126,6 +126,22 @@ Each of these cost real debugging time. Don't rediscover them.
 - **`activityEnd` must never overtake the audio in front of it.** The server finalises on
   what it has received, so an end frame that jumps the queue truncates the last words.
   Every frame goes through one serial `sendQueue`, which is what guarantees the ordering.
+- `sendQueue` only orders frames that are *on* the socket. Before `setupComplete` the audio
+  is in `buffered`, so `finish()` has to append `activityEnd` **to `buffered` too**
+  (`endTurn`), never send it directly. A turn ended before any audio arrived does not
+  truncate — it never answers at all, and the take is gone. Quick successive presses are
+  how you get there: the socket is still connecting at key-up. The old log signature is
+  `recording stopped` followed by `live session ready`, and then nothing.
+- **Never race a `Task.sleep` deadline against a `withCheckedContinuation` inside a
+  `withThrowingTaskGroup`.** The group awaits *every* child on the way out and a checked
+  continuation does not answer cancellation, so the moment the deadline child throws, the
+  group blocks forever on a continuation nothing will resume. Both `start()` and `finish()`
+  did this; the symptom was the pill stuck on "Transcribing…" until relaunch, with no error
+  anywhere. Deadlines are now `DispatchWorkItem`s that resume the one continuation
+  themselves, and every path that resumes it cancels the deadline.
+- A finish deadline that expires with some `finals` already collected returns them rather
+  than throwing. Falling back to batch is right when there is nothing; throwing away words
+  that did arrive is not.
 - Automatic voice detection is **disabled**: the hotkey defines turn boundaries, and
   server-side VAD would cut the turn whenever the speaker pauses to think.
 - Check `interimInputTranscription` **before** `inputTranscription` — a frame can carry
@@ -160,6 +176,20 @@ Each of these cost real debugging time. Don't rediscover them.
   the profile switch, not something the app can fix. Choosing a Bluetooth mic (directly or
   via System Default) *should* degrade playback; Settings says so rather than pretending
   otherwise.
+- **Opening the device must never happen on the main thread.** Measured across 98 takes in
+  the log, the gap between key-down and `recording started` reached **three seconds** — with
+  the *built-in* mic selected, so a Bluetooth profile switch is not the explanation. The
+  `open=…(resolve, configure, start)` breakdown on the `recording started` line exists to
+  attribute the next one: slow *resolve* is HAL contention, slow *configure*/*start* is the
+  device itself. Blocking main through that costs two
+  things far worse than the wait: the pill cannot appear (a slow start is indistinguishable
+  from a dead app), and macOS disables an event tap whose run loop stops answering — the
+  dropped event is usually the key *release*, which leaves the app recording with nothing
+  to stop it. All of `AudioRecorder`'s CoreAudio work runs on its serial `control` queue.
+- Resolve a UID with `kAudioHardwarePropertyTranslateUIDToDevice`, not by walking every
+  device and reading its UID. The walk queries devices we have no interest in, and a
+  Bluetooth headset in the list takes its time answering — which is how choosing the
+  built-in microphone got slower just because headphones were connected.
 - The input format must be read **after** the device is bound — a different device can
   mean a different sample rate and channel count.
 - Store the CoreAudio **device UID**, never the numeric `AudioDeviceID` (only stable
@@ -168,17 +198,49 @@ Each of these cost real debugging time. Don't rediscover them.
   barely moved the waveform: conversational level is ~0.02 RMS, which is near the floor
   linearly but around 0.5 on the dB mapping.
 
+### Take lifecycle
+
+- `AppDelegate` owns an explicit `Phase` (`idle` / `opening` / `recording` /
+  `transcribing`) rather than asking the recorder whether it is running. Since the
+  microphone opens asynchronously there is a window where that question has no useful
+  answer, and it is exactly the window a fast tap lands in.
+- A release arriving during `.opening` is **remembered** (`stopRequested`) and acted on when
+  the device answers. Dropping it — which is what a `guard recorder.isRecording` did — left
+  capture running with nothing left to stop it.
+- Every callback carries the `takeID` it belongs to, so an answer from an abandoned take
+  cannot touch the pill or the phase of the take that replaced it.
+- `armWatchdog` is a backstop, not a timeout: 60s is longer than any legitimate path (30s
+  batch + 15s formatting). It exists so the *next* hang costs one dictation instead of a
+  relaunch. Don't shorten it to "feel responsive" — that throws away slow-but-working
+  transcriptions.
+- The event tap re-arms itself when macOS disables it, and then checks the live modifier
+  state to recover a release it may have missed. That check is deliberately one-way: the
+  flag mask cannot tell left ⌘ from right ⌘, so inferring a *press* from it would start
+  dictating whenever the user reached for a shortcut on the other side of the keyboard.
+
 ### UI
 
 - The pill is an `NSPanel` with `.nonactivatingPanel` — it must never take focus, or the
   paste lands in the wrong place. Don't call `NSApp.activate` around it.
+- `show` **reuses a panel that is still fading out**, and a `generation` token stops the
+  finished fade from ordering out a panel a new take has since claimed. Releasing the panel
+  at the *start* of the dismissal instead let a burst of taps stack panels, and which one
+  survived came down to whichever animation finished last.
 - Errors get a larger panel and three lines. A one-line pill made failures unreadable
   exactly when they mattered.
 - The pill **sizes itself to its content** via `NSHostingView.fittingSize`, and
   `position()` re-centres using the panel's current width. Never give the root view
   `maxWidth: .infinity` — every state then inherits the widest one's width, which is how
-  "Transcribing…" ended up with dead space beside it. The root view keeps a `.padding(14)`
-  so the shadow has room inside the panel instead of being clipped.
+  "Transcribing…" ended up with dead space beside it.
+- **The panel must leave room for the whole shadow, and SwiftUI's blur reaches about twice
+  the nominal radius.** That is not visible from the API, and a uniform `.padding(14)`
+  under a `radius: 12, y: 4` shadow sliced the falloff off mid-gradient — which reads as a
+  straight grey edge rather than a soft shadow, worst along the bottom where the offset
+  pushes the blur further. Rendered and measured, the shadow reaches 25pt sideways, 22 up
+  and 30 down. `PillShadow` derives the insets from `radius` and `offsetY` so they cannot
+  drift apart again; change the shadow and re-render before trusting the numbers.
+- `position()` places the **capsule**, not the panel — the panel's height depends on the
+  shadow, so positioning by it would float the pill upward every time the shadow softened.
 - Background is `glassEffect(.regular, in: Capsule())` under `#available(macOS 26)`, with
   `.ultraThinMaterial` as the fallback. Text and bars use `.primary`, not white — glass
   takes on whatever is behind it, and fixed white is unreadable over a light window.
@@ -233,6 +295,12 @@ There are no tests. Check by hand:
 5. With Bluetooth headphones connected and the *built-in* mic selected, play music and
    dictate. The music must not change. If it goes muffled and mono, capture has fallen
    back to the default-device path again.
+6. With Bluetooth headphones connected, the pill must appear the instant the key goes down,
+   not when the device is ready. Compare the `target app` and `recording started` stamps in
+   the log: a gap there is now hardware latency the user never sees, not a frozen app.
+7. Mash the hotkey — a dozen quick taps, then a real dictation. Every take must end in
+   Inserted, No speech or a visible error. A pill left on "Transcribing…" means something
+   is waiting on a continuation nothing resumes.
 
 A `peakLevel` near 0 means capture failed, not the API.
 
@@ -244,5 +312,9 @@ A `peakLevel` near 0 means capture failed, not the API.
 - Don't revert to ad-hoc signing.
 - Don't move capture back to `AVAudioEngine`. It looks tidier and silently ignores the
   microphone picker.
+- Don't put CoreAudio device work back on the main thread, and don't make `AudioRecorder`'s
+  `start`/`stop` synchronous again to "simplify" the state machine.
+- Don't wrap a checked continuation and a sleeping task in a task group to build a timeout.
+  It deadlocks; give the deadline the continuation instead.
 - Don't read the key more than once per launch — `KeyStore` caches it, and repeated reads were half of what made the old Keychain implementation unbearable.
 - Don't ship a second copy of the app anywhere on disk.

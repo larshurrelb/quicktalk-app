@@ -22,8 +22,32 @@ enum AudioDevices {
             }
     }
 
+    /// The device with this UID, or nil if it isn't connected.
+    ///
+    /// This asks coreaudiod to translate the UID directly rather than walking the device
+    /// list and reading `kAudioDevicePropertyDeviceUID` off every device in it. The walk
+    /// is what made choosing the built-in microphone slow whenever Bluetooth headphones
+    /// were connected: it queries devices we have no interest in, and a headset that is
+    /// busy negotiating takes its time answering. Naming a device should never mean
+    /// touching the others. The walk stays as a fallback.
     static func deviceID(forUID uid: String) -> AudioDeviceID? {
-        allDeviceIDs().first { string($0, kAudioDevicePropertyDeviceUID) == uid }
+        var address = propertyAddress(kAudioHardwarePropertyTranslateUIDToDevice)
+        var cfUID = uid as CFString
+        var deviceID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+
+        let status = withUnsafeMutablePointer(to: &cfUID) { qualifier in
+            AudioObjectGetPropertyData(
+                AudioObjectID(kAudioObjectSystemObject), &address,
+                UInt32(MemoryLayout<CFString>.size), qualifier,
+                &size, &deviceID
+            )
+        }
+        // Translation answers with kAudioObjectUnknown rather than an error for a UID it
+        // doesn't recognise, so a zero here means "not connected", not "ask again".
+        if status == noErr { return deviceID == 0 ? nil : deviceID }
+
+        return allDeviceIDs().first { string($0, kAudioDevicePropertyDeviceUID) == uid }
     }
 
     static func name(forUID uid: String) -> String? {

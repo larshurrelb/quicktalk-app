@@ -18,8 +18,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let minimumHold: TimeInterval = 0.25
     /// Below this peak level a take is silence — see the note where it is used.
     private static let silenceThreshold: Float = 0.006
+    /// Longest a take may sit in transcription before the app gives up on it.
+    ///
+    /// Generous on purpose: a batch request allows 30s and the formatting pass another 15,
+    /// and cutting a slow-but-working request short would throw the dictation away. This
+    /// is not a timeout, it is the guarantee that a stuck pill cannot outlive one take.
+    private static let transcriptionCeiling: TimeInterval = 60
+
+    /// Where the current dictation is.
+    ///
+    /// Tracked here rather than asked of the recorder, because the microphone now opens
+    /// asynchronously: between the key going down and the device answering there is no
+    /// useful answer to "are we recording?" — and that window is exactly where a key
+    /// release used to be dropped on the floor.
+    private enum Phase {
+        case idle
+        /// Key down, microphone still opening.
+        case opening
+        /// Key down, capturing.
+        case recording
+        /// Key up, transcription in flight.
+        case transcribing
+    }
+
     private var startedAt: Date?
-    private var isBusy = false
+    private var phase: Phase = .idle
+    /// Identifies the current dictation, so a callback belonging to an abandoned one is
+    /// ignored instead of acted on. Bumped once per key-down and never in between.
+    private var takeID = 0
+    /// Set when the key came back up before the microphone finished opening.
+    private var stopRequested = false
+    private var transcription: Task<Void, Never>?
+    private var watchdog: Task<Void, Never>?
     private var trustWatcher: Timer?
     private var live: LiveTranscriber?
 
@@ -67,7 +97,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         hotkey?.stop()
-        recorder.discard()
+        // Blocking here is fine and `discard()` no longer does: it became fire-and-forget
+        // when capture moved off the main thread, which on quit means the process can exit
+        // before the take is cleaned up.
+        recorder.discardAndWait()
     }
 
     // MARK: - Status item
@@ -257,7 +290,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Dictation
 
     private func beginRecording() {
-        guard !isBusy, !recorder.isRecording else { return }
+        guard case .idle = phase else {
+            // Almost always a second press while the previous take is still transcribing.
+            // Recorded rather than silently dropped, because "I pressed it and nothing
+            // happened" is otherwise indistinguishable from a dead hotkey.
+            Diagnostics.log("press ignored — take \(takeID) is still \(phase)")
+            return
+        }
 
         guard AudioRecorder.hasMicrophoneAccess else {
             AudioRecorder.requestMicrophoneAccess { [weak self] granted in
@@ -274,18 +313,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         captureTarget()
 
-        do {
-            if settings.mode.usesLive { startLiveSession(smart: settings.mode.liveSmart) }
-            try recorder.start(deviceUID: settings.microphoneUID)
-            startedAt = Date()
-            pill.show(.listening)
-            if settings.playSound { NSSound(named: settings.startSound)?.play() }
-        } catch {
-            live?.cancel()
-            live = nil
-            Diagnostics.recordError("recorder failed to start: \(error)")
-            flash(.failure("Couldn't start the microphone — see Copy Diagnostics"))
+        takeID &+= 1
+        let take = takeID
+        phase = .opening
+        stopRequested = false
+        startedAt = Date()
+
+        // Feedback first, hardware second. Opening a microphone is neither quick nor
+        // bounded — measured at up to three seconds with Bluetooth headphones connected —
+        // and the pill used to wait behind it, which is what made dictation feel like it
+        // had not started at all. The hold is timed from here, so a slow device costs
+        // audio but never costs the press.
+        pill.show(.listening)
+        if settings.playSound { NSSound(named: settings.startSound)?.play() }
+
+        if settings.mode.usesLive { startLiveSession(smart: settings.mode.liveSmart) }
+
+        let recorder = self.recorder
+        let uid = settings.microphoneUID
+        Task { [weak self] in
+            do {
+                try await recorder.start(deviceUID: uid)
+                self?.microphoneOpened(take: take)
+            } catch {
+                self?.microphoneFailed(take: take, error: error)
+            }
         }
+    }
+
+    /// The microphone answered.
+    private func microphoneOpened(take: Int) {
+        guard take == takeID, case .opening = phase else {
+            // The take was abandoned while the device was opening, so capture is now
+            // running for a dictation nobody is waiting for. `onPCM` is left alone — a
+            // newer take may already own it, and the closure holds its session weakly.
+            recorder.discard()
+            return
+        }
+        phase = .recording
+        // The release arrived during the wait. Honouring it here rather than dropping it
+        // is the difference between a short take and a recorder that never stops.
+        if stopRequested { finishTake() }
+    }
+
+    private func microphoneFailed(take: Int, error: Error) {
+        guard take == takeID else { return }
+        phase = .idle
+        stopRequested = false
+        startedAt = nil
+        // Capture never started, but the live session set a PCM callback that has to go.
+        recorder.discard()
+        live?.cancel()
+        live = nil
+        Diagnostics.recordError("recorder failed to start: \(error)")
+        flash(.failure("Couldn't start the microphone — see Copy Diagnostics"))
     }
 
     /// Notes which app this take is for, and the instructions that go with it.
@@ -306,12 +387,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func endRecording() {
-        guard recorder.isRecording else { return }
+        switch phase {
+        case .idle, .transcribing:
+            return
+        case .opening:
+            // The key is already back up and the device has not answered yet. Remember it;
+            // `microphoneOpened` acts on it the moment capture actually exists.
+            stopRequested = true
+        case .recording:
+            finishTake()
+        }
+    }
 
+    private func finishTake() {
         let held = startedAt.map { Date().timeIntervalSince($0) } ?? 0
         startedAt = nil
+        stopRequested = false
 
         guard held >= minimumHold else {
+            phase = .idle
+            // `discard` drops the PCM callback too, on the queue where that is safe.
             recorder.discard()
             live?.cancel()
             live = nil
@@ -319,23 +414,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        guard let fileURL = recorder.stop() else {
-            live?.cancel()
-            live = nil
+        // Claimed now, before the file is closed, so a press landing in that gap is turned
+        // away by `beginRecording` rather than starting a second overlapping take.
+        phase = .transcribing
+        let take = takeID
+        // Armed here rather than once the upload starts, so that every route out of
+        // `.transcribing` — closing the file included — is covered by it.
+        armWatchdog(for: take)
+
+        let recorder = self.recorder
+        Task { [weak self] in
+            let recorded = await recorder.stop()
+            self?.recordingClosed(take: take, recorded: recorded)
+        }
+    }
+
+    private func recordingClosed(take: Int, recorded: AudioRecorder.Take?) {
+        guard take == takeID, case .transcribing = phase else { return }
+
+        let session = live
+        live = nil
+
+        guard let recorded else {
+            session?.cancel()
+            endTranscription(take)
             pill.dismiss()
             return
         }
-        recorder.onPCM = nil
 
         // Observed peaks: real speech 0.019 and up, silence 0.000–0.002. Below the gate
         // the API would return an empty transcript anyway, so skip the round trip and
         // answer instantly instead of waiting three seconds to say nothing happened.
-        if recorder.peakLevel < Self.silenceThreshold {
-            Diagnostics.log("skipped upload — peakLevel=\(String(format: "%.3f", recorder.peakLevel)) is silence")
-            try? FileManager.default.removeItem(at: fileURL)
+        if recorded.peakLevel < Self.silenceThreshold {
+            Diagnostics.log("skipped upload — peakLevel=\(String(format: "%.3f", recorded.peakLevel)) is silence")
+            try? FileManager.default.removeItem(at: recorded.fileURL)
             // Close the socket too, or a silent take leaves one open every time.
-            live?.cancel()
-            live = nil
+            session?.cancel()
+            endTranscription(take)
             pill.update(state: .silent)
             pill.dismiss(after: 1.1)
             return
@@ -343,15 +458,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if settings.playSound { NSSound(named: "Pop")?.play() }
         pill.update(state: .transcribing)
-        isBusy = true
 
         let transcriber = GeminiTranscriber(apiKey: settings.apiKey)
         let mode = settings.mode
-        let session = live
         let instructions = takeInstructions
-        live = nil
+        let fileURL = recorded.fileURL
 
-        Task { [weak self] in
+        transcription = Task { [weak self] in
             defer { try? FileManager.default.removeItem(at: fileURL) }
             do {
                 // Live first when it is running: most of the audio is already transcribed
@@ -385,29 +498,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         instructions: instructions
                     )
                 }
-                await MainActor.run {
-                    guard let self else { return }
-                    self.isBusy = false
-                    TextInserter.insert(text)
-                    self.pill.update(state: .success)
-                    self.pill.dismiss(after: 0.6)
-                }
+                self?.takeSucceeded(take: take, text: text)
             } catch {
-                await MainActor.run {
-                    guard let self else { return }
-                    self.isBusy = false
-                    if case GeminiTranscriber.TranscribeError.empty = error {
-                        Diagnostics.log("no speech in the transcript")
-                        self.pill.update(state: .silent)
-                        self.pill.dismiss(after: 1.1)
-                        return
-                    }
-                    let message = (error as? LocalizedError)?.errorDescription ?? "Transcription failed"
-                    Diagnostics.recordError(message)
-                    self.pill.update(state: .failure(message))
-                    self.pill.dismiss(after: 2.6)
-                }
+                self?.takeFailed(take: take, error: error)
             }
+        }
+    }
+
+    private func takeSucceeded(take: Int, text: String) {
+        guard endTranscription(take) else { return }
+        TextInserter.insert(text)
+        pill.update(state: .success)
+        pill.dismiss(after: 0.6)
+    }
+
+    private func takeFailed(take: Int, error: Error) {
+        guard endTranscription(take) else { return }
+
+        if case GeminiTranscriber.TranscribeError.empty = error {
+            Diagnostics.log("no speech in the transcript")
+            pill.update(state: .silent)
+            pill.dismiss(after: 1.1)
+            return
+        }
+        let message = (error as? LocalizedError)?.errorDescription ?? "Transcription failed"
+        Diagnostics.recordError(message)
+        pill.update(state: .failure(message))
+        pill.dismiss(after: 2.6)
+    }
+
+    /// Returns the app to idle if `take` is still the one in flight. False means the
+    /// answer belongs to a take that was already abandoned, and must not touch the pill.
+    @discardableResult
+    private func endTranscription(_ take: Int) -> Bool {
+        guard take == takeID, case .transcribing = phase else { return false }
+        watchdog?.cancel()
+        watchdog = nil
+        transcription = nil
+        phase = .idle
+        return true
+    }
+
+    /// The backstop that makes a permanently stuck pill impossible.
+    ///
+    /// Every network path already has its own deadline, and the live socket's deadlock —
+    /// which is what actually stranded takes on "Transcribing…" — is fixed at the source
+    /// in `LiveTranscriber`. This exists so that the *next* hang, wherever it comes from,
+    /// costs one dictation instead of requiring a relaunch.
+    private func armWatchdog(for take: Int) {
+        watchdog?.cancel()
+        watchdog = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.transcriptionCeiling * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            guard take == self.takeID, case .transcribing = self.phase else { return }
+
+            self.transcription?.cancel()
+            self.transcription = nil
+            self.watchdog = nil
+            self.live?.cancel()
+            self.live = nil
+            self.phase = .idle
+            Diagnostics.recordError("gave up on the transcript after \(Int(Self.transcriptionCeiling))s")
+            self.pill.update(state: .failure("Transcription gave up. Press again to retry."))
+            self.pill.dismiss(after: 2.6)
         }
     }
 
@@ -427,8 +580,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 await MainActor.run {
                     guard let self, self.live === session else { return }
                     self.live = nil
-                    self.recorder.onPCM = nil
                 }
+                // The callback is left in place: capture may well still be running, and
+                // clearing it from here would race the audio thread. It holds the session
+                // weakly and `close()` drops it, so a dead session costs nothing.
                 session.cancel()
             }
         }
