@@ -140,6 +140,16 @@ Each of these cost real debugging time. Don't rediscover them.
 - The log records instruction **length only**, never the text — `Copy Diagnostics` puts
   the log on the clipboard.
 
+### Diagnostics
+
+- Timestamps carry **milliseconds**. They used to be whole seconds, which meant the one
+  question the log exists to answer — how long after key-down is the app ready — could only
+  be answered statistically, by counting how many takes straddled a second boundary. Two
+  rounds of latency work were spent inferring what the log could have stated outright.
+- The timestamp is taken in `log()`, on the calling thread, never inside the writer queue.
+  A stamp applied at write time records when the logger got around to it, which is exactly
+  the number that goes wrong when the app is busy — the case worth measuring.
+
 ### Live socket
 
 - `wss://…/BidiGenerateContent`, model `gemini-3.5-transcribe-live`. The key goes in the
@@ -208,6 +218,13 @@ Each of these cost real debugging time. Don't rediscover them.
   from a dead app), and macOS disables an event tap whose run loop stops answering — the
   dropped event is usually the key *release*, which leaves the app recording with nothing
   to stop it. All of `AudioRecorder`'s CoreAudio work runs on its serial `control` queue.
+- **The start chirp opens the speakers, and on Bluetooth that is slower than the
+  microphone.** `NSSound.play()` binds the default *output* device; the first play after it
+  has gone idle measured **744 ms** with a Bluetooth headset as default output, and 1631 ms
+  on a colder link. Played inline in `beginRecording` it sat ahead of everything else, so
+  the app froze before it even started opening the input. `Chime` plays on its own serial
+  queue. This is the same bug as the microphone open, one device over — when key-down-to-
+  ready is slow, check what else the app touches before the mic, not only the mic.
 - Resolve a UID with `kAudioHardwarePropertyTranslateUIDToDevice`, not by walking every
   device and reading its UID. The walk queries devices we have no interest in, and a
   Bluetooth headset in the list takes its time answering — which is how choosing the
@@ -320,7 +337,10 @@ There are no tests. Check by hand:
 6. With Bluetooth headphones connected, the pill must appear the instant the key goes down,
    not when the device is ready. Compare the `target app` and `recording started` stamps in
    the log: a gap there is now hardware latency the user never sees, not a frozen app.
-7. Mash the hotkey — a dozen quick taps, then a real dictation. Every take must end in
+7. With Bluetooth headphones connected as the *output*, leave them idle for a few minutes,
+   then dictate. The pill must still appear instantly. `target app` → `recording started`
+   in the log is now millisecond-accurate; healthy is well under 100ms.
+8. Mash the hotkey — a dozen quick taps, then a real dictation. Every take must end in
    Inserted, No speech or a visible error. A pill left on "Transcribing…" means something
    is waiting on a continuation nothing resumes.
 

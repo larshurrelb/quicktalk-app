@@ -325,7 +325,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // had not started at all. The hold is timed from here, so a slow device costs
         // audio but never costs the press.
         pill.show(.listening)
-        if settings.playSound { NSSound(named: settings.startSound)?.play() }
+        // Off the main thread — see Chime. Played inline this was the single largest cost
+        // between the key going down and the pill going up.
+        if settings.playSound { Chime.play(settings.startSound) }
 
         if settings.mode.usesLive { startLiveSession(smart: settings.mode.liveSmart) }
 
@@ -456,7 +458,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        if settings.playSound { NSSound(named: "Pop")?.play() }
+        if settings.playSound { Chime.play("Pop") }
         pill.update(state: .transcribing)
 
         let transcriber = GeminiTranscriber(apiKey: settings.apiKey)

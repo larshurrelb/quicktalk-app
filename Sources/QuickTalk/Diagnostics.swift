@@ -15,8 +15,23 @@ enum Diagnostics {
     private static let queue = DispatchQueue(label: "com.quicktalk.QuickTalk.diagnostics")
     private static var lastErrorText: String?
 
+    /// Milliseconds, and built once.
+    ///
+    /// Whole seconds meant the interesting question — how long after the key goes down does
+    /// the app become ready — could only be answered statistically, by counting how often a
+    /// take straddled a second boundary. Two rounds of latency work were spent inferring
+    /// what the log could simply have said. Configured here and only ever read, which is
+    /// what makes sharing one formatter across threads safe.
+    private static let stamp: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
     static func log(_ message: String) {
-        let stamp = ISO8601DateFormatter().string(from: Date())
+        // Taken here rather than on the queue: the timestamp has to mark when the thing
+        // happened, not when the writer got around to it.
+        let stamp = Self.stamp.string(from: Date())
         let line = "[\(stamp)] \(redacting(message))\n"
 
         queue.async {
