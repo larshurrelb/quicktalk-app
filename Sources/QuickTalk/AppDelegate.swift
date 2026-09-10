@@ -231,7 +231,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func copyDiagnostics() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(Diagnostics.report(), forType: .string)
-        flash(.success)
+        flash(.confirmed("Diagnostics copied"))
     }
 
     private func refreshStatusTitle() {
@@ -510,8 +510,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func takeSucceeded(take: Int, text: String) {
         guard endTranscription(take) else { return }
         TextInserter.insert(text)
-        pill.update(state: .success)
-        pill.dismiss(after: 0.6)
+        // No "Inserted" step: the inserted text is the confirmation, and it appears at the
+        // cursor the user is already looking at. A pill that lingers to report success is
+        // covering part of the screen to say something the screen has already said.
+        //
+        // Only the outcomes the text cannot express keep a pill — "No speech" and errors,
+        // where nothing arrived at the cursor to explain itself.
+        pill.dismiss()
     }
 
     private func takeFailed(take: Int, error: Error) {

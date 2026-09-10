@@ -341,8 +341,10 @@ There are no tests. Check by hand:
    then dictate. The pill must still appear instantly. `target app` → `recording started`
    in the log is now millisecond-accurate; healthy is well under 100ms.
 8. Mash the hotkey — a dozen quick taps, then a real dictation. Every take must end in
-   Inserted, No speech or a visible error. A pill left on "Transcribing…" means something
-   is waiting on a continuation nothing resumes.
+   inserted text, "No speech", or a visible error. Note that success now shows *nothing*:
+   the pill disappears the moment the text lands, because the text is the confirmation.
+   A pill left on "Transcribing…" means something is waiting on a continuation nothing
+   resumes.
 
 A `peakLevel` near 0 means capture failed, not the API.
 

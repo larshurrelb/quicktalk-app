@@ -4,7 +4,12 @@ import SwiftUI
 enum PillState: Equatable {
     case listening
     case transcribing
-    case success
+    /// A menu action reporting that it worked — currently only `Copy Diagnostics`.
+    ///
+    /// Dictation does **not** use this. Inserting the text is its own confirmation, and it
+    /// lands where the user is already looking; a pill saying so afterwards is redundant
+    /// and in the way. A menu command has no such feedback of its own, so it says it here.
+    case confirmed(String)
     /// Nothing was said. Deliberately not a `failure`: it needs no warning icon, no long
     /// timeout and no red flag — nothing went wrong.
     case silent
@@ -15,6 +20,13 @@ final class PillModel: ObservableObject {
     static let barCount = 21
 
     @Published var state: PillState = .listening
+
+    /// Drives the appear/disappear animation. Starts `false` so the very first render of
+    /// a freshly built panel is the *start* of the animation rather than its end — the
+    /// panel is ordered front at that point, so the pill is on screen from the first
+    /// frame and only its scale and opacity are still catching up. Nothing waits on it.
+    @Published var presented = false
+
     /// Bar heights, 0...1. Symmetric around the centre: the whole cluster swells with
     /// your voice rather than scrolling past, so it reads as "this is how loud you are
     /// right now" instead of "here is the last second of history".
@@ -70,6 +82,46 @@ enum PillShadow {
     static let heightAboveScreenBottom: CGFloat = 102
 }
 
+/// How the pill comes and goes.
+///
+/// Both halves are deliberately short. The pill's whole job is to say "the app heard the
+/// key", so anything long enough to notice as an animation is long enough to read as lag —
+/// and the in-animation in particular runs *while* the microphone is still opening, so it
+/// must never be something the user waits through.
+///
+/// It scales and fades in place, and deliberately does **not** travel. A pill that slides
+/// up from the bottom of the screen announces itself as an arriving thing, and the eye
+/// follows the movement instead of the content; at this size and duration the travel is
+/// also the only part slow enough to perceive, so it is the part that reads as delay. A
+/// centred scale has nowhere to go — it is simply present, slightly sooner than it is
+/// fully formed.
+///
+/// Nothing in the take path awaits any of this. `show` orders the panel front and then
+/// flips a flag; Core Animation does the rest on its own thread, so the cost to key-down
+/// latency is one property assignment.
+enum PillAnimation {
+    /// Scale and opacity are given separate curves on purpose.
+    ///
+    /// The fade is what makes the pill *arrive*, so it is quick and linear-ish — the pill
+    /// is legible almost at once. The scale is what makes it feel like an object rather
+    /// than an image being cross-faded, so it is a spring, and it is still settling for a
+    /// moment after the pill is fully opaque. Run both on the spring and the pill hangs
+    /// at partial opacity through the settle, which looks like a dropped frame; run both
+    /// on the fade and it is a cross-dissolve with no life in it.
+    static let scaleIn: Animation = .spring(response: 0.26, dampingFraction: 0.84)
+    static let fadeIn: Animation = .easeOut(duration: 0.13)
+
+    /// Going out is one curve for both: there is nothing to feel, only to get out of the
+    /// way. Matches the panel's alpha fade in `fadeOut`, so the pill has finished
+    /// disappearing on the frame the panel is ordered out.
+    static let outDuration: TimeInterval = 0.14
+    static let out: Animation = .easeIn(duration: outDuration)
+
+    /// Small enough to read as the pill firming up rather than as something flying at the
+    /// screen. Below about 0.9 the scale starts to look like a zoom.
+    static let hiddenScale: CGFloat = 0.93
+}
+
 /// The floating pill.
 ///
 /// An `NSPanel` with `.nonactivatingPanel` is the whole trick: it appears above every
@@ -111,6 +163,10 @@ final class PillHUD {
             }
             resizeToFit()
             panel.orderFrontRegardless()
+            // Mid-fade panels come back with `presented` already false, so this animates
+            // the pill back up instead of snapping it. An untouched panel is already
+            // presented, so this is a no-op and animates nothing.
+            model.presented = true
             return
         }
 
@@ -137,8 +193,15 @@ final class PillHUD {
 
         self.panel = panel
         self.host = host
+        // Reset before the first layout: the model outlives any one panel, so it is still
+        // holding `false` from the last dismissal — but only by luck, and a pill that
+        // renders its finished state once has nothing left to animate from.
+        model.presented = false
         resizeToFit()
         panel.orderFrontRegardless()
+        // The flip to `true` is the view's own `onAppear`, which is guaranteed to run
+        // after that first render. Setting it from here instead is a coin toss on whether
+        // SwiftUI coalesces both values into one pass and skips the animation entirely.
     }
 
     /// Ask SwiftUI how big the pill actually wants to be, then match the panel to it and
@@ -192,8 +255,18 @@ final class PillHUD {
     }
 
     private func fadeOut(_ panel: NSPanel, token: Int) {
+        // The pill shrinks and fades (SwiftUI) while the panel fades (AppKit). Both start
+        // in this turn of the main loop and share `PillAnimation.out`'s duration, so they
+        // finish together and the panel is ordered out on the frame the pill has finished
+        // disappearing.
+        //
+        // The panel keeps fading in its own right rather than leaving opacity entirely to
+        // SwiftUI: the alpha is what the `orderOut` below is sequenced against, so if the
+        // view ever drops a frame the panel is still fully transparent by the time it
+        // vanishes — the alternative is a pill that blinks out at half opacity.
+        model.presented = false
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.18
+            context.duration = PillAnimation.outDuration
             panel.animator().alphaValue = 0
         } completionHandler: { [weak self] in
             // AppKit runs this on the main thread; the compiler just can't see that.
@@ -257,6 +330,23 @@ private struct PillView: View {
             }
         }
         .shadow(color: PillShadow.color, radius: PillShadow.radius, y: PillShadow.offsetY)
+        // Applied inside the shadow padding below, so the pill and its shadow scale
+        // together while the panel's margins stay put. Scale and opacity are both
+        // layout-neutral — `fittingSize` is unchanged, so `resizeToFit` still measures the
+        // full-size pill and the panel never has to resize mid-animation.
+        //
+        // The two `.animation`s are nested rather than combined: the inner one owns the
+        // scale, the outer one owns the opacity applied above it. Collapsing them into one
+        // modifier would force a single curve on both, which is the thing `PillAnimation`
+        // explains at length not to do.
+        .scaleEffect(model.presented ? 1 : PillAnimation.hiddenScale)
+        .animation(model.presented ? PillAnimation.scaleIn : PillAnimation.out, value: model.presented)
+        .opacity(model.presented ? 1 : 0)
+        .animation(model.presented ? PillAnimation.fadeIn : PillAnimation.out, value: model.presented)
+        // Runs after the first render, so the pill animates up from `hiddenScale` rather
+        // than simply being there. `PillHUD` drives the flag directly for a panel that is
+        // being reused mid-fade, where the view has long since appeared.
+        .onAppear { model.presented = true }
         // Room for the shadow to draw inside the panel instead of being clipped. Asymmetric
         // because the shadow is: the y offset moves the blur down, so the bottom needs more
         // room than the top and a uniform inset can only be right on one of them.
@@ -283,7 +373,7 @@ private struct PillView: View {
                     .easeInOut(duration: 0.6).repeatForever(autoreverses: true),
                     value: pulse
                 )
-        case .success:
+        case .confirmed:
             dot(Self.done)
         case .silent:
             dot(Self.quiet)
@@ -313,8 +403,8 @@ private struct PillView: View {
             Waveform(bars: model.bars)
         case .transcribing:
             label("Transcribing…")
-        case .success:
-            label("Inserted")
+        case let .confirmed(message):
+            label(message)
         case .silent:
             label("No speech")
         case let .failure(message):
