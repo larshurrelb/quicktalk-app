@@ -487,7 +487,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         Diagnostics.log("live failed (\(error.localizedDescription)) — falling back to batch")
                         text = try await transcriber.transcribe(
                             fileURL: fileURL,
-                            smart: mode.batchSmart,
                             format: mode.needsFormattingPass,
                             instructions: instructions
                         )
@@ -495,7 +494,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 } else {
                     text = try await transcriber.transcribe(
                         fileURL: fileURL,
-                        smart: mode.batchSmart,
                         format: mode.needsFormattingPass,
                         instructions: instructions
                     )

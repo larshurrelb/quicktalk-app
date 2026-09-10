@@ -46,13 +46,26 @@ Each of these cost real debugging time. Don't rediscover them.
 
 ### Gemini API
 
-- `mode: "smart"` works **only** on `POST /v1beta/interactions`. On `:generateContent`
-  the field parses and returns an empty text part.
+- **Every request goes to `:generateContent`, and `POST /v1beta/interactions` must not
+  come back.** That endpoint requires the project's storage/logging to be switched on and
+  answers HTTP 400 `Storage is off for this project` otherwise — which is the setting a
+  user who does not want Google retaining their voice recordings will have chosen. It is
+  their call to make, so nothing in the app may depend on it being made one way. Measured
+  2026-09-10 against the live API with storage off: `/v1beta/interactions` 400s,
+  `:generateContent` returns 200 and a correct transcript, and the live socket is
+  unaffected. Privacy aside, `interactions` had been failing every batch request since
+  2026-08-28 and the log says so 20 times over.
+- **Server-side smart mode is therefore not available at all**, and asking for it is a
+  hard error rather than a silent one: `transcription_config` on `:generateContent` is
+  rejected with 400 `Cannot find field`. This is a change — it used to parse and return
+  an empty text part. Smart mode's output comes from the `flash-lite` formatting pass
+  instead, which is a plain `:generateContent` call and needs no storage. Verified
+  end-to-end: dictating "First, buy some milk. Second, call the dentist…" through the
+  batch path with `format: true` returns a two-item markdown list.
 - **Never add `language_codes`.** With smart mode it silently returns verbatim output —
   HTTP 200, no error. Omitting it is also what gives automatic German/English detection.
   If someone asks for a language picker, the correct answer is that adding one breaks
   smart mode.
-- Verbatim = omit `transcription_config` entirely; that is byte-identical to sending it.
 - Modes are **Verbatim** (live, VERBATIM), **Smart** (live SMART + formatting pass) and
   **Cheap** (batch, verbatim). `TranscriptionMode.migrating` maps the retired `structured`
   and `live` raw values — don't drop it, it protects a stored preference.
@@ -81,13 +94,20 @@ Each of these cost real debugging time. Don't rediscover them.
   the rules folded back into the single user turn. That is the weaker shape this moved
   away from, kept only so a model that will not take a system instruction still formats
   dictation. Nothing else is retried — 401, 429 and 500 fail identically twice.
-- Response envelope is `steps[] → content[] → text`, filtered on `type == "model_output"`
-  and `type == "text"`. Not `candidates`.
-- **Silence returns HTTP 200 with `status: "completed"` and no `steps` key.** It is not an
-  error and must not be surfaced as one — map it to `TranscribeError.empty` → the `.silent`
-  pill state ("No speech"), never `.badResponse`. `AppDelegate` also gates on
-  `recorder.peakLevel` (< 0.006) and skips the upload entirely; observed peaks are
-  0.000–0.002 for silence against 0.019+ for speech.
+- Response envelope is `candidates[] → content → parts[]`, and the transcript is in
+  **`audioTranscription.text`, not `text`** — a transcribe model leaves `text` unset. A
+  parser that reads only `text` finds nothing and reports an empty transcript, which is
+  indistinguishable from silence and sends you looking at the microphone. `extractText`
+  accepts both, so a model that starts filling in `text` does not break the app.
+- **A response with no `candidates` key is silence, not an error.** Map it to
+  `TranscribeError.empty` → the `.silent` pill state ("No speech"), never `.badResponse`.
+  `AppDelegate` also gates on `recorder.peakLevel` (< 0.006) and skips the upload
+  entirely; observed peaks are 0.000–0.002 for silence against 0.019+ for speech.
+- **Errors reach the user through a pill three lines tall.** `TranscribeError.brief` caps
+  the server's prose at 100 characters because the caller prefixes `Gemini returned HTTP
+  400. ` and it is the whole string that has to fit — the storage error came to exactly
+  150 and SwiftUI cut it off mid-word, which made an actionable error look like a crash.
+  The full text is always in the log; `Copy Diagnostics` is where to read it.
 
 ### Per-app instructions
 

@@ -71,10 +71,6 @@ enum TranscriptionMode: String, CaseIterable, Identifiable {
     /// The second `flash-lite` pass that produces paragraphs and real lists.
     var needsFormattingPass: Bool { self == .smart }
 
-    /// What a batch request should ask for — used by `cheap`, and by any live session
-    /// that fails and falls back.
-    var batchSmart: Bool { self == .smart }
-
     var label: String {
         switch self {
         case .verbatim: return "Verbatim"

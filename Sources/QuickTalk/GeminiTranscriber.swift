@@ -1,17 +1,19 @@
 import Foundation
 
-/// Gemini 3.5 Transcribe.
+/// Gemini 3.5 Transcribe, batch path.
 ///
-/// Two things about this API are easy to get wrong, both verified by Google's own
-/// reference client against the live service:
+/// Both requests here go to `:generateContent`, and that is a deliberate constraint
+/// rather than an accident of history — see `transcribe`. Two things about this API are
+/// easy to get wrong:
 ///
-/// 1. `mode: "smart"` only works on `POST /v1beta/interactions`. On `:generateContent`
-///    the same field parses but comes back with an empty text part.
-/// 2. **Never send `language_codes` together with smart mode.** It silently disables
-///    smart formatting and returns verbatim output with HTTP 200 and no error of any
-///    kind. Omitting it is also what gives automatic language detection, so German and
-///    English (even mixed) just work — there is no language setting in this app on
-///    purpose.
+/// 1. **Never send `language_codes`.** It silently disables smart formatting and returns
+///    verbatim output with HTTP 200 and no error of any kind. Omitting it is also what
+///    gives automatic language detection, so German and English (even mixed) just work —
+///    there is no language setting in this app on purpose.
+/// 2. The transcript comes back in `audioTranscription.text`, not the `text` that every
+///    other `:generateContent` response uses. A parser that only looks at `text` sees a
+///    part it does not recognise and reports an empty transcript — which is
+///    indistinguishable from silence, and sends you looking at the microphone.
 struct GeminiTranscriber {
     var apiKey: String
     var model = "gemini-3.5-transcribe"
@@ -35,28 +37,68 @@ struct GeminiTranscriber {
             case .http(429, _):
                 return "Rate limited by Gemini. Try again in a moment."
             case let .http(code, detail):
-                return "Gemini returned HTTP \(code). \(detail)"
+                return "Gemini returned HTTP \(code). \(brief(detail))"
             case let .badResponse(reason):
                 return "Couldn't read Gemini's response (\(reason))."
             case .empty:
                 return "No speech"
             }
         }
+
+        /// Server prose, cut down to what the pill can show.
+        ///
+        /// Google's 400s run to a paragraph — the storage one was 120 characters of URL
+        /// and escalation advice — and the pill's three lines cut that off mid-word, so
+        /// an error the user might have acted on arrived looking like a crash instead.
+        /// Whatever is too long for the pill is in the log in full; `Copy Diagnostics`
+        /// is the place to read it.
+        ///
+        /// 100, not 130: the caller puts "Gemini returned HTTP 400. " in front of this,
+        /// and it is the *whole* string that has to fit. Rendered and counted — the pill
+        /// is 300pt wide at 12pt, so three lines hold about 145 characters, and the
+        /// storage error came to exactly 150 with its prefix. That is how a limit that
+        /// looked generous still truncated.
+        private func brief(_ detail: String, limit: Int = 100) -> String {
+            let flat = detail
+                .components(separatedBy: .whitespacesAndNewlines)
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+            guard flat.count > limit else { return flat }
+            // Back off to a word boundary, so the cut does not land inside a word.
+            let head = flat.prefix(limit)
+            let cut = head.lastIndex(of: " ").map { head[..<$0] } ?? head
+            return cut + "…"
+        }
     }
 
+    /// A batch transcription, always verbatim.
+    ///
+    /// There is no `smart` here any more, and it is not an oversight. Server-side smart
+    /// mode lives on `POST /v1beta/interactions`, and that endpoint **requires the
+    /// project's storage/logging to be switched on** — it answers HTTP 400 "Storage is
+    /// off for this project" otherwise, which is what a user who does not want Google
+    /// keeping their voice recordings will quite reasonably have configured. Storage is
+    /// the user's call, so the app has to work either way, which means not depending on
+    /// an endpoint that only works one of those ways.
+    ///
+    /// `:generateContent` has no such requirement, and refuses `transcription_config`
+    /// outright (HTTP 400, "Cannot find field"), so smart is simply not on offer here.
+    /// Nothing is lost that the app cannot get elsewhere: Smart mode's polish comes from
+    /// `applyFormatting` below, a separate `:generateContent` call that runs on this
+    /// transcript exactly as it runs on the live socket's.
+    ///
     /// `instructions` are the user's own standing notes for the app they are dictating
     /// into. They only reach the formatting pass — the transcribe model ignores prompts
     /// entirely, so there is nowhere else for them to go.
     func transcribe(
         fileURL: URL,
-        smart: Bool,
         format: Bool,
         instructions: String = ""
     ) async throws -> String {
         guard !apiKey.isEmpty else { throw TranscribeError.noAPIKey }
 
         let audio = try Data(contentsOf: fileURL)
-        Diagnostics.log("request smart=\(smart) audioBytes=\(audio.count)")
+        Diagnostics.log("batch request audioBytes=\(audio.count) format=\(format)")
 
         // A near-empty file means the capture, not the API, is the problem — and the
         // server would just return an unhelpful empty transcript.
@@ -64,18 +106,17 @@ struct GeminiTranscriber {
             Diagnostics.log("audio is only \(audio.count) bytes — likely nothing captured")
         }
 
-        var body: [String: Any] = [
-            "model": model,
-            "input": [["type": "audio", "mime_type": "audio/wav", "data": audio.base64EncodedString()]],
+        // Audio only: the transcribe model ignores prompts, so there is nothing else to
+        // put in the turn. No language_codes, ever, and no `transcription_config` — see
+        // the note on `smart` above for why server-side smart mode is not an option here.
+        let body: [String: Any] = [
+            "contents": [["parts": [[
+                "inline_data": ["mime_type": "audio/wav", "data": audio.base64EncodedString()],
+            ]]]]
         ]
 
-        // Verbatim is the server default, and sending it explicitly is byte-identical to
-        // omitting the field — so only smart mode adds config. No language_codes, ever.
-        if smart {
-            body["generation_config"] = ["transcription_config": ["mode": "smart"]]
-        }
-
-        var request = URLRequest(url: endpoint.appendingPathComponent("v1beta/interactions"))
+        let path = "v1beta/models/\(model):generateContent"
+        var request = URLRequest(url: endpoint.appendingPathComponent(path))
         request.httpMethod = "POST"
         request.timeoutInterval = timeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -338,29 +379,35 @@ struct GeminiTranscriber {
         """
     }
 
-    /// The interactions envelope is `{"status", "steps":[{"type","content":[{"type","text"}]}]}`
-    /// — a different shape from `:generateContent`'s `candidates/content/parts`.
+    /// `:generateContent`'s envelope, with one twist worth knowing about.
+    ///
+    /// The shape is the usual `candidates[].content.parts[]`, but a transcribe model does
+    /// not fill in `text` — it returns `{"audioTranscription": {"text": …}}`. Read only
+    /// `text` and every part looks unrecognisable, which surfaces as an empty transcript:
+    /// identical, from the outside, to a take where nobody spoke. Both are accepted here,
+    /// because a model that starts filling in `text` should not break the app either.
     static func extractText(from data: Data) throws -> String {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw TranscribeError.badResponse("unparseable JSON")
         }
-
-        let status = json["status"] as? String ?? "missing"
-        guard status == "completed" else {
-            throw TranscribeError.badResponse("status \(status)")
-        }
-        // Silence comes back as HTTP 200, status "completed", total_output_tokens 0, and
-        // no `steps` key at all — the API does not treat "nobody spoke" as an error, so
-        // neither should we. Reporting it as a malformed response was wrong.
-        guard let steps = json["steps"] as? [[String: Any]] else {
+        guard let candidates = json["candidates"] as? [[String: Any]] else {
+            // No candidates at all is how this endpoint reports a prompt it would not
+            // answer — including, occasionally, silence. Not a malformed response.
             throw TranscribeError.empty
         }
 
-        return steps
-            .filter { ($0["type"] as? String) == "model_output" }
-            .flatMap { ($0["content"] as? [[String: Any]]) ?? [] }
-            .compactMap { ($0["type"] as? String) == "text" ? $0["text"] as? String : nil }
+        let text = candidates
+            .compactMap { $0["content"] as? [String: Any] }
+            .flatMap { ($0["parts"] as? [[String: Any]]) ?? [] }
+            .compactMap { part -> String? in
+                if let transcription = part["audioTranscription"] as? [String: Any] {
+                    return transcription["text"] as? String
+                }
+                return part["text"] as? String
+            }
             .joined()
+
+        return text
     }
 
     /// First 400 characters of a response body, for the log only.
