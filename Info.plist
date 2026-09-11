@@ -23,7 +23,7 @@
     <key>LSUIElement</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>QuickTalk records your voice while you hold the push-to-talk key, and sends it to Google Gemini to be transcribed.</string>
+    <string>QuickTalk records your voice while you hold the push-to-talk key so your selected engine can transcribe it.</string>
     <key>NSHumanReadableCopyright</key>
     <string>MIT licensed. See LICENSE.</string>
 </dict>

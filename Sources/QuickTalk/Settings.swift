@@ -48,6 +48,15 @@ enum HotkeyKey: String, CaseIterable, Identifiable {
     }
 }
 
+// MARK: - Transcription
+
+enum TranscriptionEngine: String, CaseIterable, Identifiable {
+    case gemini
+    case local
+
+    var id: String { rawValue }
+}
+
 // MARK: - Transcription mode
 
 enum TranscriptionMode: String, CaseIterable, Identifiable {
@@ -115,6 +124,8 @@ final class AppSettings {
     private enum Key {
         static let hotkey = "hotkey"
         static let mode = "mode"
+        static let engine = "engine"
+        static let whisperModel = "whisperModel"
         static let playSound = "playSound"
         static let microphone = "microphoneUID"
         static let startSound = "startSound"
@@ -128,6 +139,22 @@ final class AppSettings {
     var mode: TranscriptionMode {
         get { TranscriptionMode.migrating(defaults.string(forKey: Key.mode)) }
         set { defaults.set(newValue.rawValue, forKey: Key.mode) }
+    }
+
+    /// Gemini remains the default so an upgrade changes neither behavior nor privacy
+    /// expectations until the user explicitly moves the one engine switch.
+    var engine: TranscriptionEngine {
+        get { TranscriptionEngine(rawValue: defaults.string(forKey: Key.engine) ?? "") ?? .gemini }
+        set { defaults.set(newValue.rawValue, forKey: Key.engine) }
+    }
+
+    var whisperModel: WhisperModel {
+        get {
+            let stored = WhisperModel(rawValue: defaults.string(forKey: Key.whisperModel) ?? "")
+                ?? .small
+            return WhisperModel.downloadableCases.contains(stored) ? stored : .small
+        }
+        set { defaults.set(newValue.rawValue, forKey: Key.whisperModel) }
     }
 
     var playSound: Bool {
@@ -157,6 +184,20 @@ final class AppSettings {
     }
 
     var hasAPIKey: Bool { KeyStore.read() != nil }
+
+    /// Engine-aware gates live here so a future call site cannot accidentally stream or
+    /// format a local take just because its remembered Gemini mode says to.
+    var usesLiveSocket: Bool { engine == .gemini && mode.usesLive }
+    var usesFormattingPass: Bool { engine == .gemini && mode.needsFormattingPass }
+
+    var isReadyToDictate: Bool {
+        switch engine {
+        case .gemini:
+            return hasAPIKey
+        case .local:
+            return WhisperEngine.binaryURL != nil && whisperModel.isInstalled
+        }
+    }
 
     func clearAPIKey() { KeyStore.clear() }
 }

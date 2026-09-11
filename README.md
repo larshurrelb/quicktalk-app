@@ -4,7 +4,7 @@
 
 <h1 align="center">QuickTalk</h1>
 
-<p align="center"><strong>A open source transcription App for Mac using Gemini 3.5 Transcribe.</strong></p>
+<p align="center"><strong>An open source transcription app for Mac using Gemini or local Whisper.</strong></p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/macOS-14%2B-black" alt="macOS 14+">
@@ -13,9 +13,10 @@
 </p>
 
 A push-to-talk dictation app for macOS. Menu bar only, no Dock icon, powered by Google's
-**Gemini 3.5 Transcribe** with your own API key. 
+**Gemini 3.5 Transcribe** with your own API key or **Whisper on your Mac**.
 
-No dependencies, no telemetry, no accounts. You bring your own key and Google handles the rest. 
+No bundled dependencies, no telemetry, no accounts. Use your own Gemini key, or install
+the optional local engine through Homebrew.
 
 <p align="center">
   <img src="Demo.gif" alt="QuickTalk Demo">
@@ -79,6 +80,33 @@ session, so if the socket fails the batch request runs instead — a failed sock
 latency, never words.
 
 Switch modes from the menu-bar icon under **Formatting**, without opening Settings.
+
+## Run it locally
+
+Open **Settings → Transcription → On this Mac**. QuickTalk uses Homebrew's external
+whisper.cpp engine, downloaded on demand rather than linked into or shipped with the app:
+
+```bash
+brew install whisper-cpp
+```
+
+Settings can run that exact command for you and always shows a **Copy** button as an
+escape hatch. Then download the official small model:
+
+| Model | Download | Notes |
+|---|---:|---|
+| **Small** | 190 MB | Multilingual and fast, with a small disk footprint |
+
+The model download is checked against a pinned byte count and SHA-256 digest before it is
+used. It lives in `~/Library/Application Support/QuickTalk/models/` and is excluded from
+Time Machine. **Remove** reclaims that disk space.
+
+Local dictation never sends audio or text anywhere, needs no API key, and still detects
+German and English automatically. It is not streaming: the transcript arrives after you
+release the key rather than being ready at release. Each take starts a fresh
+`whisper-cli`, which exits afterwards, so no model remains in RAM and idle cost is zero.
+Formatting modes and per-app instructions use Gemini and are therefore greyed out while
+the local engine is selected; switching back restores the mode you had selected.
 
 ### Per-app instructions
 
@@ -159,9 +187,11 @@ Keychain only raises the bar. If your machine stops being trustworthy, revoke th
   therefore no passwords, pass through this process. It's `.listenOnly`, so your
   push-to-talk key keeps working normally.
 - **The microphone is open only while you hold the key** — no idle audio session.
-- **Audio is deleted after upload**, including when transcription fails.
+- **Audio is deleted after transcription**, including when transcription fails.
 - **Your clipboard is restored** after the paste.
-- **One network destination**, `generativelanguage.googleapis.com`.
+- **Gemini mode has one transcription destination**, `generativelanguage.googleapis.com`.
+  Local mode makes no transcription request; model downloads come directly from the
+  official `ggerganov/whisper.cpp` repository on Hugging Face.
 
 ### Why there's no prebuilt download
 

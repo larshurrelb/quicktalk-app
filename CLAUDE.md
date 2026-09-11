@@ -204,6 +204,26 @@ Each of these cost real debugging time. Don't rediscover them.
 - The WAV is always written, even in live mode, so **every** live failure falls back to
   the batch request. Losing words is unacceptable; being slow is not.
 
+### Local Whisper
+
+- **Always pass `-l auto`, and never pass `-tr`.** The CLI defaults to English; omitting
+  the language flag silently breaks German, while `-tr` turns German dictation into
+  English text with no error to warn the user.
+- whisper.cpp loads the model before it reads an input file. Upstream accepts `-` and the
+  Homebrew 1.9.2 binary does consume the WAV from stdin, but that release then treats the
+  input name `-` as an output name and suppresses all transcript segments
+  (`warning: '--output-file -' used without any other '--output-*'`). Until that is fixed,
+  `LocalTranscriber.start()` is the documented no-op fallback and `finish` launches with
+  `-f <wav>` at key-up. Re-test stdin before moving the spawn back to key-down.
+- Homebrew builds `WHISPER_BUILD_SERVER=OFF`; it ships `whisper-cli` and no
+  `whisper-server`. There is deliberately no persistent warm process, unload button, or
+  idle RAM cost. One CLI process owns one take and exits.
+- If stdin is restored, write the WAV on a background queue and drain stdout and stderr
+  concurrently. A ~480 KB WAV does not fit in a ~64 KB pipe, and stderr can fill too.
+  Never block the same thread on writing and reading. Process deadlines follow the live
+  socket rule: one `DispatchWorkItem` owns the continuation, termination owns the other
+  path, and every resume cancels the deadline before it resumes.
+
 ### Audio
 
 - **Capture is a raw AUHAL, not `AVAudioEngine`. Do not "simplify" it back.**

@@ -52,6 +52,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var watchdog: Task<Void, Never>?
     private var trustWatcher: Timer?
     private var live: LiveTranscriber?
+    private var local: LocalTranscriber?
 
     /// The instructions for the app that was frontmost when the key went down, captured
     /// at the *start* of the take. By the time the transcript comes back the user may
@@ -82,7 +83,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // First run: nothing works without a key and permissions, so say so up front
         // rather than failing silently on the first press.
-        if !settings.hasAPIKey || !HotkeyMonitor.canObserveKeys {
+        if !settings.isReadyToDictate || !HotkeyMonitor.canObserveKeys {
             settingsWindow?.show()
         }
     }
@@ -97,6 +98,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         hotkey?.stop()
+        local?.cancel()
+        local = nil
         // Blocking here is fine and `discard()` no longer does: it became fire-and-forget
         // when capture moved off the main thread, which on quit means the process can exit
         // before the take is cleaned up.
@@ -131,6 +134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         let heading = NSMenuItem(title: "Formatting", action: nil, keyEquivalent: "")
         heading.isEnabled = false
+        heading.identifier = Self.formattingHeadingID
         menu.addItem(heading)
 
         for mode in TranscriptionMode.allCases {
@@ -168,6 +172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private static let targetItemID = NSUserInterfaceItemIdentifier("targetApp")
+    private static let formattingHeadingID = NSUserInterfaceItemIdentifier("formattingHeading")
 
     /// Shows the app the hotkey would dictate into, and turns into a shortcut to its
     /// rule. Reading it here rather than tracking it live is the same trade the mode
@@ -214,11 +219,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func refreshModeChecks() {
         guard let items = statusItem?.menu?.items else { return }
+        items.first(where: { $0.identifier == Self.formattingHeadingID })?.title =
+            settings.engine == .local ? "Formatting — off on this Mac" : "Formatting"
         for item in items {
             guard let raw = item.representedObject as? String,
                   let mode = TranscriptionMode(rawValue: raw)
             else { continue }
             item.state = (mode == settings.mode) ? .on : .off
+            item.isEnabled = settings.engine == .gemini
         }
     }
 
@@ -240,6 +248,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             title = "⚠︎ Input Monitoring not granted — hotkey inactive"
         } else if !HotkeyMonitor.hasAccessibilityPermission {
             title = "⚠︎ Accessibility not granted — can't paste"
+        } else if settings.engine == .local, WhisperEngine.binaryURL == nil {
+            title = "⚠︎ Install the Whisper engine in Settings"
+        } else if settings.engine == .local, !settings.whisperModel.isInstalled {
+            title = "⚠︎ Download the Whisper model in Settings"
+        } else if settings.engine == .gemini, !settings.hasAPIKey {
+            title = "⚠︎ Add your Gemini API key in Settings"
         } else {
             title = "Hold \(settings.hotkey.label) to dictate"
         }
@@ -305,8 +319,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        guard settings.hasAPIKey else {
-            flash(.failure("Add your Gemini API key"))
+        guard settings.isReadyToDictate else {
+            let message: String
+            if settings.engine == .gemini {
+                message = "Add your Gemini API key"
+            } else if WhisperEngine.binaryURL == nil {
+                message = "Install the Whisper engine"
+            } else {
+                message = "Download the Whisper model"
+            }
+            flash(.failure(message))
             settingsWindow?.show()
             return
         }
@@ -329,7 +351,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // between the key going down and the pill going up.
         if settings.playSound { Chime.play(settings.startSound) }
 
-        if settings.mode.usesLive { startLiveSession(smart: settings.mode.liveSmart) }
+        if settings.engine == .local {
+            let session = LocalTranscriber(model: settings.whisperModel)
+            do {
+                try session.start()
+                local = session
+            } catch {
+                phase = .idle
+                startedAt = nil
+                let message = (error as? LocalizedError)?.errorDescription
+                    ?? "Local transcription isn't ready"
+                Diagnostics.recordError(message)
+                flash(.failure(message))
+                return
+            }
+        } else if settings.usesLiveSocket {
+            startLiveSession(smart: settings.mode.liveSmart)
+        }
 
         let recorder = self.recorder
         let uid = settings.microphoneUID
@@ -350,6 +388,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // running for a dictation nobody is waiting for. `onPCM` is left alone — a
             // newer take may already own it, and the closure holds its session weakly.
             recorder.discard()
+            local?.cancel()
+            local = nil
             return
         }
         phase = .recording
@@ -367,6 +407,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         recorder.discard()
         live?.cancel()
         live = nil
+        local?.cancel()
+        local = nil
         Diagnostics.recordError("recorder failed to start: \(error)")
         flash(.failure("Couldn't start the microphone — see Copy Diagnostics"))
     }
@@ -378,7 +420,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// there is nothing to carry and the rule is deliberately not read.
     private func captureTarget() {
         let app = frontmost.refresh()
-        takeInstructions = settings.mode.needsFormattingPass
+        takeInstructions = settings.usesFormattingPass
             ? settings.appRules.instructions(for: app?.bundleID)
             : ""
 
@@ -412,6 +454,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             recorder.discard()
             live?.cancel()
             live = nil
+            local?.cancel()
+            local = nil
             pill.dismiss()
             return
         }
@@ -436,9 +480,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let session = live
         live = nil
+        let localSession = local
 
         guard let recorded else {
             session?.cancel()
+            localSession?.cancel()
+            local = nil
             endTranscription(take)
             pill.dismiss()
             return
@@ -452,6 +499,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try? FileManager.default.removeItem(at: recorded.fileURL)
             // Close the socket too, or a silent take leaves one open every time.
             session?.cancel()
+            localSession?.cancel()
+            local = nil
             endTranscription(take)
             pill.update(state: .silent)
             pill.dismiss(after: 1.1)
@@ -461,14 +510,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if settings.playSound { Chime.play("Pop") }
         pill.update(state: .transcribing)
 
-        let transcriber = GeminiTranscriber(apiKey: settings.apiKey)
+        let fileURL = recorded.fileURL
+        let transcriber = localSession == nil
+            ? GeminiTranscriber(apiKey: settings.apiKey)
+            : nil
         let mode = settings.mode
         let instructions = takeInstructions
-        let fileURL = recorded.fileURL
 
         transcription = Task { [weak self] in
             defer { try? FileManager.default.removeItem(at: fileURL) }
             do {
+                if let localSession {
+                    let text = try await localSession.finish(wav: fileURL)
+                    self?.takeSucceeded(take: take, text: text)
+                    return
+                }
+
+                guard let transcriber else {
+                    throw LocalTranscriber.LocalError.failed("The local engine was unavailable.")
+                }
                 // Live first when it is running: most of the audio is already transcribed
                 // by the time the key comes up. The recorded file is still on disk, so a
                 // socket that failed costs latency, never words.
@@ -526,6 +586,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             pill.dismiss(after: 1.1)
             return
         }
+        if case LocalTranscriber.LocalError.empty = error {
+            Diagnostics.log("no speech in the local transcript")
+            pill.update(state: .silent)
+            pill.dismiss(after: 1.1)
+            return
+        }
         let message = (error as? LocalizedError)?.errorDescription ?? "Transcription failed"
         Diagnostics.recordError(message)
         pill.update(state: .failure(message))
@@ -540,6 +606,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         watchdog?.cancel()
         watchdog = nil
         transcription = nil
+        local = nil
         phase = .idle
         return true
     }
@@ -562,6 +629,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.watchdog = nil
             self.live?.cancel()
             self.live = nil
+            self.local?.cancel()
+            self.local = nil
             self.phase = .idle
             Diagnostics.recordError("gave up on the transcript after \(Int(Self.transcriptionCeiling))s")
             self.pill.update(state: .failure("Transcription gave up. Press again to retry."))

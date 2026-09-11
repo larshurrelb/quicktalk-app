@@ -71,6 +71,8 @@ private struct SettingsView: View {
 
     @State private var apiKey: String
     @State private var hasKey: Bool
+    @State private var engine: TranscriptionEngine
+    @State private var whisperModel: WhisperModel
     @State private var mode: TranscriptionMode
     @State private var hotkey: HotkeyKey
     @State private var playSound: Bool
@@ -80,6 +82,7 @@ private struct SettingsView: View {
     @State private var inputGranted: Bool
     @State private var microphoneUID: String
     @State private var devices: [AudioInputDevice]
+    @StateObject private var whisperSetup = WhisperSetupState()
 
     @ObservedObject private var appRules: AppRuleStore
 
@@ -96,6 +99,8 @@ private struct SettingsView: View {
         // every time Settings opens. Empty means "leave whatever is stored alone".
         _apiKey = State(initialValue: "")
         _hasKey = State(initialValue: settings.hasAPIKey)
+        _engine = State(initialValue: settings.engine)
+        _whisperModel = State(initialValue: settings.whisperModel)
         _mode = State(initialValue: settings.mode)
         _hotkey = State(initialValue: settings.hotkey)
         _playSound = State(initialValue: settings.playSound)
@@ -121,7 +126,10 @@ private struct SettingsView: View {
             header
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    apiKeySection
+                    transcriptionSection
+                    if engine == .gemini {
+                        apiKeySection
+                    }
                     recordingSection
                     formattingSection
                     permissionsSection
@@ -142,6 +150,7 @@ private struct SettingsView: View {
             inputGranted = HotkeyMonitor.hasInputMonitoringPermission
             // Devices come and go — refresh whenever the window is opened.
             devices = AudioDevices.inputDevices()
+            whisperSetup.refresh()
         }
     }
 
@@ -176,7 +185,7 @@ private struct SettingsView: View {
     /// A one-glance answer to "will this work if I hold the key right now?" — the same
     /// conditions the menu bar title reports, plus the key.
     private var statusChip: some View {
-        let ready = hasKey && allPermissionsGranted
+        let ready = engineReady && allPermissionsGranted
         return HStack(spacing: 5) {
             Circle()
                 .fill(ready ? Color.green : Color.orange)
@@ -202,6 +211,141 @@ private struct SettingsView: View {
     }
 
     // MARK: - Sections
+
+    private var transcriptionSection: some View {
+        section("Transcription") {
+            VStack(alignment: .leading, spacing: 6) {
+                Picker("", selection: $engine) {
+                    Text("Gemini (cloud)").tag(TranscriptionEngine.gemini)
+                    Text("On this Mac").tag(TranscriptionEngine.local)
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .onChange(of: engine) { _, value in
+                    settings.engine = value
+                    whisperSetup.refresh()
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+
+            if engine == .local {
+                rowDivider
+                whisperEngineRows
+                rowDivider
+                whisperModelRows
+                if let error = whisperSetup.errorMessage {
+                    rowDivider
+                    warningRow(error)
+                }
+            }
+        } footer: {
+            if engine == .local {
+                caption("Runs entirely on this Mac — nothing leaves your computer. Multilingual support.")
+            } else {
+                caption("Gemini streams or uploads each dictation using the API key below.")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var whisperEngineRows: some View {
+        if let version = whisperSetup.engineVersion {
+            row("Engine") {
+                HStack(spacing: 6) {
+                    Text(version).font(.system(size: 11)).foregroundStyle(.secondary)
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                }
+            }
+        } else {
+            row("Engine") {
+                HStack(spacing: 5) {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                    Text("not found").font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+            }
+            rowDivider
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Text(WhisperEngine.installCommand)
+                        .font(.system(size: 11, design: .monospaced))
+                        .textSelection(.enabled)
+                    Spacer(minLength: 8)
+                    Button("Install") { whisperSetup.installEngine() }
+                        .controlSize(.small)
+                        .disabled(whisperSetup.installingEngine)
+                    Button("Copy", action: copyInstallCommand)
+                        .controlSize(.small)
+                }
+                if whisperSetup.installingEngine {
+                    HStack(spacing: 7) {
+                        ProgressView().controlSize(.small)
+                        Text(whisperSetup.installDetail)
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+        }
+    }
+
+    private var whisperModelRows: some View {
+        VStack(spacing: 0) {
+            row("Model") {
+                if WhisperModel.downloadableCases.count == 1 {
+                    Text("\(whisperModel.label) (\(whisperModel.sizeLabel))")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                } else {
+                    Picker("", selection: $whisperModel) {
+                        ForEach(WhisperModel.downloadableCases) { model in
+                            Text("\(model.label) (\(model.sizeLabel))").tag(model)
+                        }
+                    }
+                    .labelsHidden()
+                    .fixedSize()
+                    .disabled(whisperSetup.downloadingModel != nil)
+                    .onChange(of: whisperModel) { _, value in
+                        settings.whisperModel = value
+                        whisperSetup.refresh()
+                    }
+                }
+            }
+
+            rowDivider
+            HStack(spacing: 8) {
+                if whisperSetup.installedModels.contains(whisperModel) {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    Text("Installed").font(.system(size: 11)).foregroundStyle(.secondary)
+                    Spacer(minLength: 8)
+                    Button("Remove") { whisperSetup.remove(whisperModel) }
+                        .controlSize(.small)
+                } else if whisperSetup.downloadingModel == whisperModel {
+                    ProgressView(value: whisperSetup.modelProgress)
+                        .frame(maxWidth: .infinity)
+                    Text("\(Int(whisperSetup.modelProgress * 100)) %")
+                        .font(.system(size: 11).monospacedDigit())
+                        .frame(width: 34, alignment: .trailing)
+                    Button("Cancel") { whisperSetup.cancelDownload() }
+                        .controlSize(.small)
+                } else {
+                    Text("Not downloaded").font(.system(size: 11)).foregroundStyle(.secondary)
+                    Spacer(minLength: 8)
+                    Button("Download \(whisperModel.sizeLabel)") {
+                        whisperSetup.download(whisperModel)
+                    }
+                    .controlSize(.small)
+                    .disabled(whisperSetup.downloadingModel != nil)
+                }
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 30)
+        }
+    }
 
     private var apiKeySection: some View {
         section("Gemini API key") {
@@ -340,11 +484,17 @@ private struct SettingsView: View {
                         .controlSize(.small)
                 }
             }
+            .disabled(engine == .local)
         } footer: {
-            caption(mode == .smart
-                ? "Standing notes per app — “use more emojis” in a chat app, plain prose in an editor. Applied to whichever app is in front when you press the key."
-                : "Instructions are only used in Smart mode, which is the only mode with a formatting step to apply them in.")
+            if engine == .local {
+                caption("Formatting and per-app instructions use Gemini, so they are off while transcription runs on this Mac. Your selected mode is kept for when you switch back.")
+            } else {
+                caption(mode == .smart
+                    ? "Standing notes per app — “use more emojis” in a chat app, plain prose in an editor. Applied to whichever app is in front when you press the key."
+                    : "Instructions are only used in Smart mode, which is the only mode with a formatting step to apply them in.")
+            }
         }
+        .disabled(engine == .local)
     }
 
     /// Three rows while anything is missing, one line once it is all granted. The long
@@ -402,6 +552,21 @@ private struct SettingsView: View {
     private static let apiKeyURL = URL(string: "https://aistudio.google.com/apikey")!
 
     private var allPermissionsGranted: Bool { micGranted && inputGranted && axGranted }
+
+    private var engineReady: Bool {
+        switch engine {
+        case .gemini:
+            return hasKey
+        case .local:
+            return whisperSetup.engineVersion != nil
+                && whisperSetup.installedModels.contains(whisperModel)
+        }
+    }
+
+    private func copyInstallCommand() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(WhisperEngine.installCommand, forType: .string)
+    }
 
     private func section<Content: View, Footer: View>(
         _ title: String,
