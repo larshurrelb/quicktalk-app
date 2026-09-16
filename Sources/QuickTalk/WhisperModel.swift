@@ -2,16 +2,16 @@ import Combine
 import CryptoKit
 import Foundation
 
-/// The intentionally small model catalogue. Names, byte counts and digests are pinned
+/// The supported model catalogue. Names, byte counts and digests are pinned
 /// to the official ggerganov/whisper.cpp files so a partial or substituted download is
 /// never handed to an executable.
 enum WhisperModel: String, CaseIterable, Identifiable {
     case largeTurbo
     case small
 
-    /// Models offered by Settings. Large turbo stays fully described above so restoring
-    /// it later is a one-line change: add `.largeTurbo` to this array.
-    static let downloadableCases: [WhisperModel] = [.small]
+    /// Models offered by Settings, ordered from the smaller default to the larger,
+    /// more accurate option.
+    static let downloadableCases: [WhisperModel] = [.small, .largeTurbo]
 
     var id: String { rawValue }
 

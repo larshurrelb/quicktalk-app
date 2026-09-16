@@ -91,11 +91,12 @@ brew install whisper-cpp
 ```
 
 Settings can run that exact command for you and always shows a **Copy** button as an
-escape hatch. Then download the official small model:
+escape hatch. Choose and download either official model:
 
 | Model | Download | Notes |
 |---|---:|---|
 | **Small** | 190 MB | Multilingual and fast, with a small disk footprint |
+| **Large turbo** | 574 MB | More accurate, with a larger disk and memory footprint |
 
 The model download is checked against a pinned byte count and SHA-256 digest before it is
 used. It lives in `~/Library/Application Support/QuickTalk/models/` and is excluded from

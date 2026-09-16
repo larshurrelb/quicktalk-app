@@ -54,8 +54,8 @@ final class SettingsWindowController {
     }
 
     /// Shared by the window and the view's own frame — they have to agree, or the
-    /// content is either clipped or floating in dead space. Only the header and the
-    /// bottom note are pinned; the cards between them scroll, so the rows that appear
+    /// content is either clipped or floating in dead space. Only the header is pinned;
+    /// the cards beneath it scroll, so the rows that appear
     /// conditionally (a microphone warning, the three permission rows) can grow past
     /// this without being cut off. Sized so the settled state — permissions granted,
     /// no warning — needs no scrolling at all.
@@ -112,7 +112,7 @@ private struct SettingsView: View {
         _devices = State(initialValue: AudioDevices.inputDevices())
     }
 
-    /// Header and footnote are pinned; the cards scroll between them.
+    /// The header is pinned; the cards beneath it scroll.
     ///
     /// The cards are built by hand rather than with `Form { }.formStyle(.grouped)`,
     /// which was the obvious thing to reach for and was measured at ~950pt of content —
@@ -138,7 +138,6 @@ private struct SettingsView: View {
                 .padding(.top, 2)
                 .padding(.bottom, 14)
             }
-            footnote
         }
         .frame(width: SettingsWindowController.width, height: SettingsWindowController.height)
         // Stated rather than inherited: the cards are `controlBackgroundColor`, and they
@@ -196,18 +195,6 @@ private struct SettingsView: View {
         .padding(.horizontal, 9)
         .padding(.vertical, 4)
         .background(.quaternary, in: Capsule())
-    }
-
-    private var footnote: some View {
-        Text("Language is detected automatically — German and English need no switching.")
-            .font(.system(size: 11))
-            .foregroundStyle(.secondary)
-            .multilineTextAlignment(.center)
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity)
-            .padding(.horizontal, 20)
-            .padding(.top, 10)
-            .padding(.bottom, 14)
     }
 
     // MARK: - Sections
