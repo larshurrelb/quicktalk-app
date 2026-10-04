@@ -170,6 +170,7 @@ final class PillHUD {
             return
         }
 
+        let generationAtShow = generation
         let panel = NSPanel(
             contentRect: NSRect(origin: .zero, size: Self.initialSize),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -199,9 +200,15 @@ final class PillHUD {
         model.presented = false
         resizeToFit()
         panel.orderFrontRegardless()
-        // The flip to `true` is the view's own `onAppear`, which is guaranteed to run
-        // after that first render. Setting it from here instead is a coin toss on whether
-        // SwiftUI coalesces both values into one pass and skips the animation entirely.
+        // The view's `onAppear` normally flips this, after the first render. It is not
+        // relied on alone: in a panel that never becomes key, `onAppear` has been seen not
+        // to run, which leaves the pill at opacity 0 — present, ordered front, invisible.
+        // One turn of the run loop later the first render has happened, so setting it here
+        // still animates; if `onAppear` already did it, this is a no-op.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.panel === panel, self.generation == generationAtShow else { return }
+            self.model.presented = true
+        }
     }
 
     /// Ask SwiftUI how big the pill actually wants to be, then match the panel to it and
